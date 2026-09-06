@@ -17,11 +17,12 @@ Everything runs client-side. No image is uploaded anywhere, and there is no back
 6. [Anatomical landmarks](#anatomical-landmarks)
 7. [What is real and what is not](#what-is-real-and-what-is-not)
 8. [Tuning](#tuning)
-9. [Testing](#testing)
-10. [Bugs found along the way](#bugs-found-along-the-way)
-11. [Known limitations](#known-limitations)
-12. [Replacing the detector with a trained model](#replacing-the-detector-with-a-trained-model)
-13. [Credits and licence](#credits-and-licence)
+9. [The capacity model](#the-capacity-model)
+10. [Testing](#testing)
+11. [Bugs found along the way](#bugs-found-along-the-way)
+12. [Known limitations](#known-limitations)
+13. [Replacing the detector with a trained model](#replacing-the-detector-with-a-trained-model)
+14. [Credits and licence](#credits-and-licence)
 
 ---
 
@@ -68,9 +69,11 @@ every stage shows its working, and every stage states plainly what it does not k
 ```
 index.html        Overview and diagrams
 screening.html    The application: upload, pipeline, results, printable report
+pipeline.html     Capacity model: where the screening programme chokes
 reference.html    Clinical reference and method summary
 css/style.css     All styling for every page
-js/app.js         The entire engine
+js/app.js         The screening engine
+js/pipeline.js    The capacity model (independent of the screening engine)
 README.md         This file
 ```
 
@@ -140,8 +143,24 @@ normalised.
 It is always computed against the "disease present" class, so it shows what evidence the model finds
 for disease even when its final answer is "no disease".
 
-Two implementation details matter:
+Three implementation details matter:
 
+- **The map is confined to the retina, and scaled there.** This is the fix for the most misleading
+  behaviour the app ever had. The network sees a 224×224 square, but on a fundus photograph most of
+  that square is the black surround outside the camera aperture, which is not retina and where
+  activation means nothing. Grad-CAM is conventionally divided by its own maximum — and on an image
+  with nothing to find, the largest response left after the ReLU could easily be a corner of that
+  surround. Scaled to itself, that corner became 1.0 and was circled as the model's strongest
+  evidence: the app confidently marked a region outside the eye. The map is now masked to the fitted
+  aperture, trimmed by half a Grad-CAM cell to absorb the bilinear-upsampling bleed at its edge, and
+  rescaled inside that mask, so the surround can neither be marked nor set the scale.
+- **Nothing is circled when there is no hotspot.** Because the map is always scaled to its own
+  maximum, *some* pixel is always 1.0, and a fixed fraction-of-peak cut therefore always returns a
+  region — on a healthy retina, the tallest bump in an essentially flat map. A region must now also
+  stand clear of the retina's own typical activation, measured as median plus three median absolute
+  deviations over retina only, and a map whose retinal median is already above 0.55 is reported as
+  warm-everywhere with no regions at all. A genuine focal hotspot clears both cuts easily, so this
+  costs nothing where there is something to find.
 - **Layer choice.** The last convolutional layer is only 7×7 at this model's input size, which
   becomes roughly 114-pixel blocks when scaled to the display and makes the map look rectangular. The
   app uses `conv_pw_11_relu`, the deepest 14×14 layer, halving the cell size. Everything after that
@@ -159,6 +178,10 @@ they match, because a legend that disagrees with the pixels is worse than no leg
 
 **Grad-CAM answers "what drove this prediction", not "where are the lesions".** Those are different
 questions with different answers.
+
+**"No regions marked" is a real answer, not a failure.** It means the model's attention was diffuse
+across the retina rather than concentrated anywhere in it. The step says so in words instead of
+circling the highest corner of a flat map, which is what it used to do.
 
 ### Stage 4 — Lesion candidates
 
@@ -229,6 +252,9 @@ assumed.
 A production version of this analysis would be a Simulink model in MATLAB. This is a lightweight
 stand-in for early planning.
 
+The full version of it lives on its own page, `pipeline.html` — see
+[the capacity model](#the-capacity-model) below.
+
 ---
 
 ## The lesion detector in detail
@@ -270,6 +296,71 @@ what ships.
 changes across the element, so a lesion's step edge answers strongly while the macula's gradual
 darkening barely answers at all, however much darker the macula is overall. No rule about where the
 macula is was needed.
+
+### Where elongation is not enough: crossings, branches and bends
+
+The elongation argument has one systematic blind spot, and it accounted for most of the marks that
+looked like lesions but were plainly vessels.
+
+The argument is that a vessel survives the closing along its own direction. That holds only where a
+vessel is locally straight and alone. It fails in exactly three places, and all three are common:
+
+- where two vessels **cross**,
+- where one **branches**,
+- at the apex of a tight **bend**.
+
+In none of these is the structure straight in any direction, so every orientation fills it, it
+answers the roundness test precisely as a lesion does, and it is seeded. No refinement of the
+top-hat can fix this, because at the junction the two genuinely do look the same.
+
+What differs is the **surroundings**. A lesion is an isolated blob with normal retina around it; a
+junction has vessel running out of it. So each small dark candidate is now judged by what leaves it:
+rays are walked outward in 24 directions from just beyond the candidate's edge, and a direction
+counts as an *arm* only if the vessel map persists along most of that walk.
+
+| Arms found | Reading | Verdict |
+|---|---|---|
+| 0 or 1 | free-standing, or lying against one vessel | keep |
+| 2, roughly opposite | a vessel passes straight through | **keep** — this is what a microaneurysm on a venule looks like |
+| 2, at an angle | the vessel turns here; the turn is what was detected | reject |
+| 3 or more | a crossing or a bifurcation | reject |
+| vessel persisting in ≥70% of all directions | buried inside the vascular tree | reject |
+
+Keeping the opposite-arms case is the point of the whole design. A microaneurysm beside a venule is
+real, and is the commonest early sign of the disease; a test that deleted that class would cost far
+more than it saved.
+
+**Why rays and not a ring.** A ring drawn around the candidate was tried first, and it fails for a
+reason worth recording, because a ring is the obvious construction. The vessel map is built from
+pixels that are thin in some direction but not round in all of them — and at the *edge* of a round
+lesion, that is exactly what the pixels are: the roundness response has fallen away while the
+thinness response has not. Every lesion therefore carries a thin collar of false vessel a few pixels
+wide. A ring drawn close enough to a microaneurysm to describe its surroundings lands squarely in
+that collar, reads vessel in every direction, and throws away the very lesions the test exists to
+protect. Measured on synthetic retinas, the ring version rejected three planted lesions and no
+vessels at all. Walking outward separates the two cleanly: a collar is a few pixels deep and then
+stops, while a vessel arm keeps going. Requiring the vessel to *persist* along a ray, rather than
+merely to be present at one radius, is the whole difference.
+
+### Candidates lying along a vessel
+
+The one case morphology cannot settle is a candidate sitting within the course of a straight vessel:
+a microaneurysm on a venule and a wide spot in that venule have the same shape, and a
+microaneurysm is often *narrower* than the vein it sits on, so protrusion does not separate them
+either.
+
+Rather than guess, the app does two things and says so:
+
+- It holds such candidates to a **stricter contrast bar** (1.35× the usual). Contrast is measured
+  against a background that deliberately excludes vessels, so a vessel scores well on it simply for
+  being a vessel; a candidate on the vasculature has to clear a higher bar before the same number
+  means the same thing. A faint wide spot fails; a focal lesion does not.
+- It **marks them**. They are struck through on the fundus overlay, counted in the legend, and
+  called out in the summary. A reader deciding whether a mark is a lesion or part of the vessel it
+  sits on needs to be told which marks are which, and the mask alone cannot say.
+
+They are not deleted. Silently removing a class that contains real and important findings would be
+the wrong trade in a screening tool.
 
 ### Seeds and growth
 
@@ -394,6 +485,78 @@ bound candidate sizes. Each is commented with what it trades off.
 
 ---
 
+## The capacity model
+
+`pipeline.html` is the systems-engineering half of the problem, and it is entirely separate from the
+screening engine: `js/pipeline.js` shares no code with `js/app.js`, touches no image, and loads no
+model.
+
+The question it answers is the one that decides whether a screening programme works: given a
+population to screen, **which single stage stops it reaching that population?** Everything on the
+page is arranged around making that stage obvious.
+
+### The model
+
+Six stages, each with a demand and a capacity, both in the stage's own natural units:
+
+| Stage | Demand | Capacity |
+| --- | --- | --- |
+| Image acquisition | usable images **plus retakes** | stations × images/station/day |
+| Quality gate | every capture | unbounded — pixel statistics on the capture device |
+| Network transfer | images that passed quality | bandwidth × 3600 × hours ÷ (MB × 8) |
+| AI inference | one pass per image | images/min × 1440 × nodes |
+| Referral triage | every screened patient | unbounded — a comparison, not a queue |
+| Specialist review | patients × referral rate | ophthalmologists × reviews/day |
+
+Utilisation is demand ÷ capacity. The choke point is the stage where it is highest, and when it
+exceeds 1.0 the whole programme runs at `target ÷ that ratio`, because a chain runs at the speed of
+its slowest stage.
+
+Three modelling choices are worth stating, because the earlier throughput step got all three wrong
+by treating every stage as a simple `min()` over capacities:
+
+- **Retakes load the camera and nothing else.** The quality check runs on the capture device, so a
+  rejected frame is never uploaded, never inferred, never reviewed. Acquisition demand is therefore
+  `usable ÷ (1 − reject rate)` while every downstream stage sees only `usable`.
+- **Only referrals reach a specialist.** That gate is the entire point of automating the first read,
+  and a model that sends every image to an ophthalmologist cannot show the benefit of having the
+  model at all. Review demand is `patients × referral rate`, counted in patients rather than images
+  because a specialist reviews a person, both eyes at once.
+- **Demand is separate from capacity at acquisition.** The old step conflated "images acquired per
+  day" with "images the cameras can do per day", which made the acquisition stage incapable of ever
+  being the bottleneck. Demand now comes from the target population; capacity comes from the
+  hardware.
+
+### The diagram
+
+A Simulink-style block diagram, drawn in SVG and regenerated on every input change. Each block
+carries its name, demand, capacity and utilisation, and is filled from a utilisation ramp: teal
+where there is headroom, green, amber around 75%, orange approaching saturation, red past 100%.
+Wires carry the demand handed from one stage to the next and thicken with it. A red badge on a block
+gives the daily shortfall where one exists.
+
+**Colour never carries a fact on its own.** The choke point is also outlined heavily, badged
+`CHOKE POINT`, named in a sentence above the table, listed first in the relief order, and marked in
+the stage table — so the page works in greyscale and for a colour-blind reader. A scale is printed
+under the diagram so the tones can be read rather than guessed. Stages that cannot bind are drawn
+neutral grey rather than green, because "no capacity limit" and "plenty of headroom" are different
+statements and should not look the same.
+
+Below the diagram: a plain-language verdict, a stage table, a twelve-month backlog projection, and
+the stages ordered by which would bind next with the ceiling each imposes — because relieving the
+choke point only helps until the next stage becomes the limit.
+
+### What it does not model
+
+It is steady-state and deterministic. It assumes demand arrives evenly, that staff and cameras are
+available every day they are counted, and that nothing fails. Real queues are worse than
+steady-state ones, so wherever it shows a stage just under 100%, expect a queue in practice. It
+treats specialist review as a single pool rather than a rota, ignores patient waiting time between
+stages, and assumes every flagged patient is reviewed exactly once. It is a floor on the difficulty,
+not a forecast — and the page says so.
+
+---
+
 ## Testing
 
 The algorithms are pure computation, so they are tested directly in Node against functions extracted
@@ -418,6 +581,45 @@ fixture rather than the code:
 - Every planted lesion must have measurable contrast against its own surroundings. A lesion drawn at
   the same value as a shadow it sits on is invisible by construction.
 - No probe that must report nothing may sit on a planted feature.
+
+### Measuring the Grad-CAM and vessel fixes
+
+The claims above are measurements, not impressions. Two harnesses were used.
+
+**Geometry, in Node.** The vessel-arm test is exercised against synthetic vessel maps: crossings,
+bifurcations, acute branches, bends at 100°, 135° and 160°, a vessel passing straight through, a
+lesion beside a vessel, a lesion buried in vasculature, and — the case that broke the first
+implementation — lesion collars of 4, 5 and 6 pixels with and without vessels through them. 15/15.
+The Grad-CAM gate is exercised against synthetic activation maps on a circular aperture: a focal
+hotspot, two hotspots, a flat map, a broad gentle bump, and a map whose strongest raw response is in
+the surround. 5/5, with zero regions marked in the surround in every case.
+
+**The whole pipeline, in headless Chrome over CDP.** A synthetic fundus is generated in the page,
+handed to the file input, and the pipeline is run to completion with the real TensorFlow.js model
+loaded. The pre-fix and post-fix engines are run on the identical image. This is what produced the
+numbers quoted below, and it also confirms the page raises no console errors end to end.
+
+| Synthetic retina | Measure | Before | After |
+| --- | --- | --- | --- |
+| Healthy (vessels only) | surround pixels painted by Grad-CAM | 128,276 of 128,310 (100%) | **0** |
+| Healthy | Grad-CAM regions marked | 3, all outside the eye | **1, on the retina** |
+| Healthy | lesion candidates (all false) | 45 | **7** |
+| With 8 planted lesions | lesion candidates | 54 | **14** |
+
+The last row is the one that matters most: the drop is in the false positives, not the findings.
+Before, the diseased image produced 9 more candidates than the healthy one; after, 7 — so nearly all
+of the lesion-driven signal survives while roughly 38 vessel artefacts per image do not.
+
+**Caveat on the synthetic fundus.** It is drawn, not photographed. Its vessels are cleaner than real
+ones and it has no drusen, no pigment, no camera artefacts, and no real pathology. It is adequate to
+show that the surround is no longer painted and that vessel structures no longer seed candidates,
+and adequate to show that planted lesions survive. It is **not** evidence of sensitivity or
+specificity on real fundus photographs, and none is claimed.
+
+> **Note.** The three suites in the table above are described as they were designed; the test files
+> themselves are not in this repository. Treat the counts in that table as documentation of intent
+> rather than as something you can re-run today. The two harnesses in this section were run against
+> the code as it stands.
 
 ---
 
@@ -445,6 +647,28 @@ measurement.
    bright, producing a ring of spurious bright findings.
 8. **Blur and noise estimation called a helper several million times per pass.** Inlining took the
    blur stage from 7077 ms to 119 ms and the noise estimate from 2784 ms to 48 ms.
+9. **Grad-CAM marked regions outside the eye.** The map was divided by its maximum over the whole
+   224×224 input, most of which on a fundus photograph is the black surround outside the camera
+   aperture. On an image with nothing to find, the largest response left after the ReLU was often in
+   that surround; scaled to itself it became 1.0 and was circled as the model's strongest evidence.
+   Measured on a synthetic healthy retina: **all three marked regions were in the frame corners,
+   outside the eye, and 100% of the 128,310 surround pixels were painted with heat.** After masking
+   the map to the aperture and rescaling inside it: 0% painted, and the one region marked is on the
+   retina.
+10. **Grad-CAM always marked something, even with nothing to find.** A consequence of the same
+    normalisation: some pixel is always 1.0, so a fixed fraction-of-peak cut always returns a region.
+    On a healthy retina that region is just the tallest bump in a flat map. Regions must now also
+    stand clear of the retina's own median activation.
+11. **Vessel crossings, bifurcations and bends were reported as lesions.** The elongation test that
+    separates vessels from lesions assumes a vessel is locally straight; at a junction it is not, so
+    every orientation fills it and it seeds exactly like a lesion. This was the bulk of the marks
+    that were plainly vessels. Fixed by walking rays outward and counting how many carry vessel —
+    see [above](#where-elongation-is-not-enough-crossings-branches-and-bends).
+12. **The first fix for that rejected real lesions instead.** A ring sampled around the candidate
+    landed in the collar of false vessel that every round lesion carries at its own edge, so it read
+    vessel in all directions. It rejected three planted lesions and zero vessels before being
+    replaced by the outward walk. Recorded because a ring is the obvious construction and it is
+    wrong for a non-obvious reason.
 
 ---
 
@@ -465,6 +689,15 @@ measurement.
 - **Landmark estimates can be wrong** on images with bright artefacts, heavy vignetting, a disc
   cropped at the frame edge, or a photograph not centred on the posterior pole.
 - **Nothing is validated against clinical ground truth.**
+- **A candidate lying along a straight vessel cannot be resolved by shape.** A microaneurysm on a
+  venule and a wide spot in that venule have the same geometry, and the microaneurysm is often
+  *narrower* than the vein, so protrusion does not separate them either. Such candidates are kept,
+  held to a stricter contrast bar, and struck through on the overlay so a reader can see which marks
+  sit on the vasculature — but the app cannot tell you which of them are real.
+- **The rim of the retina is not assessed by Grad-CAM.** At the resolution of the layer the map is
+  read from, a cell straddling the aperture edge is computed mostly from the black surround, so it
+  is trimmed. The dashed "analysed field" circle on both Grad-CAM panels shows exactly where that
+  boundary falls. Nothing outside it is assessed, and nothing outside it is ruled out.
 
 ---
 

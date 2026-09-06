@@ -16,6 +16,26 @@
   // deepest 14x14 layer, halving the cell size for the same kind of features.
   const CAM_LAYER_CANDIDATES = ["conv_pw_11_relu", "conv_pw_13_relu"];
   const LAST_CONV_LAYER = "conv_pw_13_relu";
+  // Spatial resolution of the chosen Grad-CAM layer at a 224px input. Used only
+  // to size the trim that absorbs the upsampling bleed past the aperture edge,
+  // so being one step out is harmless.
+  const CAM_GRID_HINT = 14;
+  // How far above the retina's own typical activation a region must peak before
+  // it is marked. Grad-CAM is scaled to its own maximum, so *something* always
+  // reaches 1.0 — including on an image where the model found nothing. This is
+  // what separates a hotspot from the top of a flat map, and it is measured
+  // against the map's median absolute deviation over retina, so it follows each
+  // image rather than assuming a fixed contrast.
+  const CAM_NOISE_K = 3.0;
+  // A map whose retinal median is already this high is uniformly warm: there is
+  // no hotspot to speak of, only a ceiling, and circling its highest corner
+  // would invent a localisation the model never made.
+  const CAM_FLAT_MEDIAN = 0.55;
+  // The cosmetic fade at the edge of the analysed field, as a fraction of the
+  // trim itself. Sized this way the overlay ramps out across most of the trimmed
+  // rim, so the boundary reads as a vignette rather than as a hard ring drawn
+  // around the eye. Drawing only — detection uses the hard mask.
+  const FIELD_FEATHER_FRAC = 0.7;
   const GAP_LAYER = "global_average_pooling2d";
   const DENSE_LAYER = "dense";
   const WORKING_MAX_DIM = 800;   // cap for the working/display canvas
@@ -502,18 +522,24 @@
 
     const gradTensor = grads[varName];
 
+    // Deliberately NOT normalised here. Dividing by the global max inside the
+    // graph is what put the heat map in the black surround: the network sees a
+    // 224x224 square, most of which on a fundus photograph is not retina at all,
+    // and on an image with nothing to find the largest response left after the
+    // ReLU can easily be a corner of that surround. Scaled to its own maximum
+    // that corner becomes 1.0 and gets circled as the model's strongest
+    // evidence. The raw map is carried out instead and scaled against the
+    // retina only, below.
     const resized = tf.tidy(() => {
       const pooledGrad = gradTensor.mean([0,1,2]);           // per-channel weight
       const convSq = convVar.squeeze([0]);                   // [H,W,C]
       const weighted = convSq.mul(pooledGrad);
       let cam = weighted.sum(-1);                            // [H,W]
       cam = cam.relu();
-      const maxV = cam.max();
-      cam = cam.div(maxV.add(1e-8));
       return tf.image.resizeBilinear(cam.expandDims(-1), [canvas.height, canvas.width]); // [H,W,1]
     });
 
-    const camArray = await resized.data();
+    const raw = await resized.data();
     const h = resized.shape[0], w = resized.shape[1];
 
     inputTensor.dispose();
@@ -522,28 +548,138 @@
     convVar.dispose();
     resized.dispose();
 
-    return { camArray, h, w };
+    const conf = confineCamToRetina(canvas, raw, w, h);
+    return { camArray: conf.camArray, h, w, inside: conf.inside, feather: conf.feather,
+             field: conf.field, insideCount: conf.insideCount, rawMax: conf.rawMax, stats: conf.stats };
   }
 
-  function describeGradCAM(camArray, h, w, anatomy){
-    let maxVal = -Infinity, maxIdx = 0, sum = 0;
-    for (let i=0;i<camArray.length;i++){
-      sum += camArray[i];
-      if (camArray[i] > maxVal){ maxVal = camArray[i]; maxIdx = i; }
+  // Restricts the activation map to the retina and rescales it there.
+  //
+  // Two separate things go wrong without this, and they compound. First, the
+  // black surround outside the camera aperture is not retina, so any activation
+  // over it is meaningless by construction — yet it is included in the maximum
+  // the map is divided by, and on a clean image it can *be* that maximum.
+  // Second, the map arrives as a bilinear upsample of a 14x14 grid, so each cell
+  // spans about a fourteenth of the frame and activation from the last ring of
+  // retina bleeds well past the aperture edge. Masking alone would therefore
+  // still leave a bright rim just inside the border. The mask is eroded by half
+  // a cell to absorb that bleed before anything is measured.
+  function confineCamToRetina(canvas, raw, w, h){
+    const { lum } = imageChannels(canvas);
+    const ap = apertureGeometry(lum, w, h);
+    let inside = retinaFieldMask(lum, w, h, 0.05);
+    // Half a Grad-CAM cell at this display size. Below the CAM's own resolution
+    // there is nothing to be gained by a finer trim, and above it genuine
+    // peripheral evidence starts being discarded.
+    const bleed = Math.max(2, Math.round(Math.min(w,h)/(CAM_GRID_HINT*2)));
+    inside = erodeMask(inside, w, h, bleed);
+
+    const n = w*h;
+    let insideCount = 0, rawMax = 0;
+    for (let i=0;i<n;i++){
+      if (!inside[i]) continue;
+      insideCount++;
+      if (raw[i] > rawMax) rawMax = raw[i];
     }
+
+    // A soft copy of the same boundary, for drawing only. Painting an overlay
+    // through the hard mask leaves a step at its edge — analysed retina tinted,
+    // the trimmed rim not — and that step reads as a rendering fault rather than
+    // as the edge of the analysed field. A box blur of the mask gives a weight
+    // that falls from one to zero across a few pixels, so the overlay fades out
+    // instead. Detection still uses the hard mask: what is measured and what is
+    // painted are deliberately not the same thing.
+    const feather = boxBlur(Float32Array.from(inside), w, h,
+      clampInt(Math.round(bleed*FIELD_FEATHER_FRAC), 3, 24));
+    // Where that boundary lies, so the panels can draw it. The rim between this
+    // circle and the aperture is real retina that is deliberately not judged:
+    // a Grad-CAM cell straddling the edge is computed from a receptive field
+    // that is mostly black surround, so its value says nothing about retina.
+    // Showing the line turns an unexplained ring into a stated exclusion.
+    const field = { cx: ap.cx, cy: ap.cy, r: Math.max(1, ap.R*0.955 - bleed) };
+
+    const camArray = new Float32Array(n);
+    if (insideCount === 0 || rawMax <= 1e-12){
+      return { camArray, inside, feather, field, insideCount, rawMax, stats: { median:0, mad:0 } };
+    }
+    const invMax = 1/rawMax;
+    for (let i=0;i<n;i++) camArray[i] = inside[i] ? raw[i]*invMax : 0;
+
+    return { camArray, inside, feather, field, insideCount, rawMax, stats: camFieldStats(camArray, inside, n) };
+  }
+
+  // Median and median absolute deviation of the normalised map over retina only,
+  // by histogram so it stays a linear pass. These are what tell a focal hotspot
+  // from a map that is simply bright everywhere: the peak is 1.0 either way, but
+  // only in the first case is the typical retinal pixel far below it.
+  function camFieldStats(cam, inside, n){
+    const BINS = 512;
+    const hist = new Int32Array(BINS);
+    let count = 0;
+    const step = n > 300000 ? 2 : 1;
+    for (let i=0;i<n;i+=step){
+      if (!inside[i]) continue;
+      let b = (cam[i]*BINS)|0;
+      if (b >= BINS) b = BINS-1; else if (b < 0) b = 0;
+      hist[b]++; count++;
+    }
+    if (!count) return { median:0, mad:0 };
+    const half = count/2;
+    let cum = 0, median = 0;
+    for (let b=0;b<BINS;b++){
+      cum += hist[b];
+      if (cum >= half){ median = (b+0.5)/BINS; break; }
+    }
+    const ahist = new Int32Array(BINS);
+    for (let i=0;i<n;i+=step){
+      if (!inside[i]) continue;
+      let a = cam[i] - median;
+      if (a < 0) a = -a;
+      let b = (a*BINS)|0;
+      if (b >= BINS) b = BINS-1;
+      ahist[b]++;
+    }
+    let acum = 0, mad = 1;
+    for (let b=0;b<BINS;b++){
+      acum += ahist[b];
+      if (acum >= half){ mad = (b+0.5)/BINS; break; }
+    }
+    return { median, mad: 1.4826*mad };
+  }
+
+  // Every statistic here is taken over retina only. Measured over the whole
+  // frame instead, the black surround contributes a large block of zeros that
+  // inflates the concentration figure — a map spread evenly across the whole
+  // retina still looks focal simply because the retina is a minority of the
+  // frame — and the peak it reports can land outside the eye entirely.
+  function describeGradCAM(cam, anatomy){
+    const { camArray, h, w, inside, insideCount, stats } = cam;
+    const n = w*h;
+    let maxVal = -Infinity, maxIdx = -1, sum = 0;
+    const vals = new Float32Array(insideCount || 0);
+    let k = 0;
+    for (let i=0;i<n;i++){
+      if (inside && !inside[i]) continue;
+      const v = camArray[i];
+      sum += v;
+      if (k < vals.length) vals[k++] = v;
+      if (v > maxVal){ maxVal = v; maxIdx = i; }
+    }
+    if (maxIdx < 0) maxIdx = 0;
     const py = Math.floor(maxIdx/w), px = maxIdx % w;
     const region = anatomy
       ? quadrantLabel(px, py, anatomy.disc, anatomy.nasalSide)
       : (py < h*0.5 ? "superior" : "inferior") + " frame";
 
-    const sorted = Array.from(camArray).sort((a,b)=>b-a);
+    const sorted = Array.prototype.slice.call(vals.subarray(0, k)).sort((a,b)=>b-a);
     const topN = Math.max(1, Math.round(sorted.length*0.1));
     let topSum = 0;
-    for (let i=0;i<topN;i++) topSum += sorted[i];
+    for (let i=0;i<topN && i<sorted.length;i++) topSum += sorted[i];
     const concentration = sum > 1e-8 ? topSum/sum : 0;
     const focal = concentration > 0.35;
+    const flat = !!(stats && stats.median >= CAM_FLAT_MEDIAN);
 
-    return { region, focal, concentration, peakX: px, peakY: py };
+    return { region, focal, flat, concentration, median: stats ? stats.median : 0, peakX: px, peakY: py };
   }
 
   // ---------------------------------------------------------------------
@@ -842,15 +978,30 @@
   // DEFECT REGION MARKING: connected components of the Grad-CAM above a
   // fraction of peak activation, via iterative flood fill (no recursion).
   // ---------------------------------------------------------------------
-  function findDefectBlobs(camArray, h, w, threshold, minAreaFrac){
+  //
+  // Two things decide the threshold, and the second one is why an image with
+  // nothing to find now produces no circles at all. Grad-CAM is scaled to its
+  // own maximum, so some pixel is always 1.0 and a fixed fraction-of-peak cut
+  // always returns a region — on a healthy retina, the tallest bump in a flat
+  // map. Requiring the region to also stand clear of the retina's own typical
+  // activation removes exactly that case and leaves a genuine hotspot, which
+  // clears both cuts easily, untouched. `inside` restricts everything to the
+  // retina, so the black surround can neither be marked nor set the scale.
+  function findDefectBlobs(camArray, h, w, threshold, minAreaFrac, inside, stats){
     const total = h*w;
     const minArea = Math.max(20, Math.round(total*minAreaFrac));
     const visited = new Uint8Array(total);
     const stack = new Int32Array(total);
     const blobs = [];
 
+    // A map that is warm everywhere localises nothing, whatever its peak.
+    if (stats && stats.median >= CAM_FLAT_MEDIAN) return [];
+    const noiseCut = stats ? stats.median + CAM_NOISE_K*stats.mad : 0;
+    const cut = Math.max(threshold, noiseCut);
+    const isIn = inside ? (i => inside[i] === 1) : (() => true);
+
     for (let start=0; start<total; start++){
-      if (visited[start] || camArray[start] < threshold) continue;
+      if (visited[start] || !isIn(start) || camArray[start] < cut) continue;
       let sp = 0;
       stack[sp++] = start;
       visited[start] = 1;
@@ -865,19 +1016,19 @@
         // 4-connectivity, guarding against row wrap-around on the horizontal neighbours
         if (x > 0){
           const n = idx-1;
-          if (!visited[n] && camArray[n] >= threshold){ visited[n]=1; stack[sp++]=n; }
+          if (!visited[n] && isIn(n) && camArray[n] >= cut){ visited[n]=1; stack[sp++]=n; }
         }
         if (x < w-1){
           const n = idx+1;
-          if (!visited[n] && camArray[n] >= threshold){ visited[n]=1; stack[sp++]=n; }
+          if (!visited[n] && isIn(n) && camArray[n] >= cut){ visited[n]=1; stack[sp++]=n; }
         }
         if (y > 0){
           const n = idx-w;
-          if (!visited[n] && camArray[n] >= threshold){ visited[n]=1; stack[sp++]=n; }
+          if (!visited[n] && isIn(n) && camArray[n] >= cut){ visited[n]=1; stack[sp++]=n; }
         }
         if (y < h-1){
           const n = idx+w;
-          if (!visited[n] && camArray[n] >= threshold){ visited[n]=1; stack[sp++]=n; }
+          if (!visited[n] && isIn(n) && camArray[n] >= cut){ visited[n]=1; stack[sp++]=n; }
         }
       }
 
@@ -914,7 +1065,7 @@
     return CAM_STOPS[CAM_STOPS.length-1].slice(1);
   }
 
-  function renderGradCAMColour(sourceCanvas, camArray, targetCanvas){
+  function renderGradCAMColour(sourceCanvas, camArray, targetCanvas, inside, feather){
     const w = sourceCanvas.width, h = sourceCanvas.height;
     targetCanvas.width = w; targetCanvas.height = h;
     const ctx = targetCanvas.getContext("2d");
@@ -922,11 +1073,17 @@
     const imgData = ctx.getImageData(0,0,w,h);
     const d = imgData.data;
     for (let i=0, px=0; px<w*h; i+=4, px++){
+      // Outside the analysed field the map has no meaning, so it is left
+      // unpainted rather than tinted with the bottom of the palette — the tint
+      // reads as a measurement, and there is none there.
+      const fw = feather ? feather[px] : (inside ? inside[px] : 1);
+      if (fw <= 0.002) continue;
       const t = camArray[px];
       const c = camColour(t);
       // Opacity rises with the value, so weak areas keep showing the retina
-      // instead of being flooded with the low end of the palette.
-      const a = 0.20 + 0.55*t;
+      // instead of being flooded with the low end of the palette, and falls to
+      // nothing across the edge of the analysed field.
+      const a = (0.20 + 0.55*t) * fw;
       d[i]   = d[i]*(1-a)   + c[0]*a;
       d[i+1] = d[i+1]*(1-a) + c[1]*a;
       d[i+2] = d[i+2]*(1-a) + c[2]*a;
@@ -934,17 +1091,20 @@
     ctx.putImageData(imgData, 0, 0);
   }
 
-  function renderGradCAMOverlay(sourceCanvas, camArray, camH, camW, targetCanvas){
+  function renderGradCAMOverlay(sourceCanvas, camArray, camH, camW, targetCanvas, inside, feather){
     const w = sourceCanvas.width, h = sourceCanvas.height;
     targetCanvas.width = w; targetCanvas.height = h;
     const ctx = targetCanvas.getContext("2d");
     ctx.drawImage(sourceCanvas, 0, 0);
     const imgData = ctx.getImageData(0,0,w,h);
     const d = imgData.data;
-    const alpha = 0.55;
+    const base = 0.55;
     for (let y=0; y<h; y++){
       for (let x=0; x<w; x++){
         const idx = y*w + x;
+        const fw = feather ? feather[idx] : (inside ? inside[idx] : 1);
+        if (fw <= 0.002) continue;
+        const alpha = base * fw;
         const a = camArray[idx];
         const overlayGray = a*255;
         const p = idx*4;
@@ -1035,7 +1195,8 @@
         index: n,
         quadrant: anatomy ? quadrantLabel(b.cx, b.cy, anatomy.disc, anatomy.nasalSide) : "n/a",
         peak: b.peak,
-        areaPct: (b.area/(w*h))*100
+        areaPct: (b.area/(w*h))*100,
+        areaPx: b.area
       });
     });
     return { findings, discCount };
@@ -1463,6 +1624,168 @@
     return { darkSeed, brightSeed, vesselMask };
   }
 
+  // ---------------------------------------------------------------------
+  // VESSEL-JUNCTION TEST
+  //
+  // The directional top-hat that finds lesions has one systematic blind spot,
+  // and it is the whole reason a healthy retina came back covered in
+  // microaneurysm marks. The test asks whether a structure is filled in by a
+  // linear closing in *every* direction; a vessel is not, because it survives
+  // the element that lies along it. But that argument only holds where a vessel
+  // is locally straight and alone. Where two vessels cross, where one branches,
+  // and at the apex of a tight bend, there is no direction in which the
+  // structure is straight — so every orientation fills it, it answers the
+  // roundness test exactly as a lesion does, and it is seeded. Those three
+  // configurations are common, they lie all over the vascular arcades, and they
+  // are precisely the "veins" being reported as lesions.
+  //
+  // No refinement of the top-hat itself can separate them, because at the
+  // junction the two really do look the same. What differs is the surroundings:
+  // a lesion is an isolated blob with normal retina around it, while a junction
+  // has vessel running out of it in three or four directions. So the region is
+  // judged by what leaves it. A ring is sampled just outside the candidate and
+  // divided into angular sectors:
+  //
+  //   0 or 1 vessel arm   free-standing lesion, or one sitting against a vessel
+  //   2 opposite arms     a vessel passing straight through — a microaneurysm or
+  //                       dot hemorrhage on a vessel looks like this, and those
+  //                       are real, so this case is KEPT
+  //   2 arms at an angle  a bend: the vessel turns here, and the turn is what was
+  //                       detected
+  //   3 or more arms      a crossing or a bifurcation
+  //
+  // Keeping the antipodal case is what stops this from throwing away genuine
+  // lesions on vessels, which is the failure mode that matters most: a
+  // microaneurysm beside a venule is a real finding and by far the commonest
+  // early sign.
+  // How far a two-armed candidate's arms may fall short of opposite before the
+  // structure is read as a bend rather than a vessel running through. Deliberately
+  // wide. A vessel curving gently past a small hemorrhage does not leave in
+  // exactly opposite directions, and the cost of the two errors is not
+  // symmetric: dropping a real lesion is worse than keeping a kink, so only a
+  // pronounced turn is called a bend.
+  const JUNCTION_ANTIPODAL_TOL_DEG = 45;
+  // A candidate lying along the course of a vessel is not rejected — a
+  // microaneurysm beside a venule is real, and by far the commonest early sign,
+  // so deleting this class would cost more than it saves. It is held to a
+  // stricter contrast bar instead, and reported as vessel-associated so a reader
+  // can see which marks sit on the vasculature. The factor is deliberately
+  // modest: enough to drop a wide spot in a vein that is only as dark as the
+  // vein, not enough to drop a focal lesion on one.
+  const ON_VESSEL_CONTRAST_FACTOR = 1.35;
+  // A candidate with vessel persisting outward in this much of every direction
+  // is inside the vascular tree, not a discrete lesion within it. Because the
+  // measure is now persistence rather than mere presence, a lesion's collar
+  // cannot reach this, and the threshold can stay strict.
+  const JUNCTION_RING_SATURATION = 0.70;
+
+  // Arms are counted on each ring separately and the busiest ring decides.
+  // Unioning the rings first was measured to lose the commonest case of all: two
+  // vessels branching at an acute angle are still touching a ring drawn close in,
+  // so they merge into one wide arm and the bifurcation reads as a lone vessel.
+  // They separate further out. Saturation is judged on the innermost ring
+  // instead, because "buried in vasculature" is a statement about the
+  // candidate's immediate surroundings, and a wide enough ring eventually hits
+  // vessels on any retina.
+  // Arms are found by walking outward, not by sampling a ring.
+  //
+  // A ring was tried first and failed for a reason worth recording, because it
+  // looks like the obvious construction. The vessel map is built from pixels
+  // that are thin in some direction but not round in all of them — and at the
+  // *edge* of a round lesion that is exactly what the pixels are: the roundness
+  // response has fallen away while the thinness response has not. So every
+  // lesion carries a thin collar of false vessel a few pixels wide. A ring drawn
+  // close enough to a microaneurysm to describe its surroundings lands squarely
+  // in that collar, reads vessel in every direction, and the test throws away the
+  // very lesions it exists to protect. Measured on synthetic retinas, the ring
+  // version rejected three planted lesions and no vessels at all.
+  //
+  // Walking outward separates the two cleanly. A collar is a few pixels deep and
+  // then stops; a vessel arm continues for as far as the walk goes. Requiring the
+  // vessel to *persist* along a ray, rather than merely to be present at one
+  // radius, is what tells a lesion's own edge from a vessel leaving a junction.
+  const ARM_DIRECTIONS = 24;
+  // How much of the walk must be on vessel before the direction counts as an arm.
+  const ARM_PERSISTENCE = 0.55;
+  // The walk starts clear of the candidate's own collar and runs about a vessel
+  // element's length — far enough to outlast a collar, short enough that a
+  // curving vessel has not yet left the ray.
+  const ARM_COLLAR_PAD = 3;
+
+  function vesselArms(cx, cy, area, vesselZone, w, h, armLength){
+    const r0 = Math.sqrt(Math.max(area,1)/Math.PI);
+    const inner = r0 + ARM_COLLAR_PAD;
+    const outer = inner + Math.max(8, armLength);
+    const steps = Math.max(6, Math.round(outer - inner));
+
+    const hit = new Uint8Array(ARM_DIRECTIONS);
+    for (let d=0; d<ARM_DIRECTIONS; d++){
+      const th = 2*Math.PI*d/ARM_DIRECTIONS;
+      const c = Math.cos(th), sn = Math.sin(th);
+      // A perpendicular tolerance of one pixel keeps the ray on a vessel that
+      // leans slightly, without letting it wander onto a neighbouring one.
+      const px = -sn, py = c;
+      let on = 0, seen = 0;
+      for (let k=0; k<=steps; k++){
+        const r = inner + (outer-inner)*k/steps;
+        let any = 0;
+        for (let o=-1; o<=1; o++){
+          const x = Math.round(cx + r*c + o*px);
+          const y = Math.round(cy + r*sn + o*py);
+          if (x < 0 || y < 0 || x >= w || y >= h) continue;
+          if (vesselZone[y*w + x]){ any = 1; break; }
+        }
+        seen++; on += any;
+      }
+      if (seen && on/seen >= ARM_PERSISTENCE) hit[d] = 1;
+    }
+
+    let hits = 0;
+    for (let d=0; d<ARM_DIRECTIONS; d++) hits += hit[d];
+    if (hits === 0) return { arms: 0, coverage: 0, angles: [] };
+    if (hits === ARM_DIRECTIONS) return { arms: 1, coverage: 1, angles: [0] };
+
+    // Contiguous runs of arm directions, counted around the circle: one vessel
+    // several directions wide is one arm, not several.
+    let start = 0;
+    while (hit[start]) start++;                  // begin at a gap, so runs do not wrap
+    const angles = [];
+    let i = 0;
+    while (i < ARM_DIRECTIONS){
+      if (!hit[(start + i) % ARM_DIRECTIONS]){ i++; continue; }
+      let len = 0, sum = 0;
+      while (len < ARM_DIRECTIONS){
+        const j = (start + i + len) % ARM_DIRECTIONS;
+        if (!hit[j]) break;
+        sum += (start + i + len);
+        len++;
+      }
+      angles.push(((sum/len) % ARM_DIRECTIONS) * 360/ARM_DIRECTIONS);
+      i += len;
+    }
+    return { arms: angles.length, coverage: hits/ARM_DIRECTIONS, angles };
+  }
+
+  function isVesselJunction(ctx){
+    if (ctx.coverage >= JUNCTION_RING_SATURATION) return true;
+    if (ctx.arms >= 3) return true;
+    if (ctx.arms === 2){
+      // Opposite arms are one vessel passing through, which a real lesion may
+      // legitimately sit on. Anything else is the vessel changing direction.
+      return !isThroughVessel(ctx);
+    }
+    return false;
+  }
+
+  // Two arms leaving in roughly opposite directions: a vessel runs through this
+  // region rather than ending, branching or turning in it.
+  function isThroughVessel(ctx){
+    if (ctx.arms !== 2) return false;
+    let d = Math.abs(ctx.angles[0] - ctx.angles[1]);
+    if (d > 180) d = 360 - d;
+    return Math.abs(d - 180) <= JUNCTION_ANTIPODAL_TOL_DEG;
+  }
+
   function dilateMask(mask, w, h, radius){
     const f = new Float32Array(mask.length);
     for (let i=0;i<mask.length;i++) f[i] = mask[i];
@@ -1587,10 +1910,26 @@
       return (dx*dx + dy*dy) > edgeR2;
     }
 
+    // The junction test is only meaningful at the scale vessels cross and branch
+    // at. A large blot hemorrhage genuinely does have several vessels running out
+    // of the area around it, and testing one would throw away a real and serious
+    // finding, so anything wider than a couple of vessel widths is exempt.
+    const seLen = Math.max(3, Math.round(Math.min(w,h)*LINEAR_SE_FRAC));
+    const junctionMaxArea = Math.round(Math.PI*(seLen*2.0)*(seLen*2.0));
+    // How far to walk when looking for vessel arms: about one and a half
+    // vessel elements, which outlasts any lesion collar.
+    const junctionArmLen = seLen*1.5;
+
     const candidates = [];
-    const rejected = { vessel:0, tooLarge:0, tooSmall:0, disc:0, weak:0, streak:0, noSeed:0, macula:0, smooth:0, edge:0 };
+    const rejected = { vessel:0, junction:0, tooLarge:0, tooSmall:0, disc:0, weak:0, streak:0, noSeed:0, macula:0, smooth:0, edge:0 };
 
     const darkCovered = new Uint8Array(n), brightCovered = new Uint8Array(n);
+
+    function vesselOverlapFrac(c){
+      let on = 0;
+      for (let i=0;i<c.pixels.length;i++) if (vesselZone[c.pixels[i]]) on++;
+      return c.pixels.length ? on/c.pixels.length : 0;
+    }
 
     function classify(comps, dark){
       const covered = dark ? darkCovered : brightCovered;
@@ -1605,9 +1944,28 @@
         if (isEdgeArtifact(c)){ rejected.edge++; return; }
         if (c.aspect > 4.0 && c.fillRatio < 0.30){ rejected.streak++; return; }
 
+        // A region lying almost entirely on the vessel map is a piece of vessel,
+        // whatever seeded it. The threshold is high on purpose: a lesion touching
+        // a vessel overlaps it partially, and must survive.
+        if (vesselOverlapFrac(c) > VESSEL_OVERLAP_REJECT){ rejected.vessel++; return; }
+
+        // Crossings, bifurcations and tight bends answer the roundness test the
+        // same way a lesion does. They are told apart by what runs out of them.
+        let onVessel = false;
+        if (dark && c.area <= junctionMaxArea){
+          const ctx = vesselArms(c.cx, c.cy, c.area, vesselZone, w, h, junctionArmLen);
+          if (isVesselJunction(ctx)){ rejected.junction++; return; }
+          onVessel = isThroughVessel(ctx) || ctx.arms >= 1;
+        }
+
         const floor = dark ? DARK_CONTRAST_FLOOR : BRIGHT_CONTRAST_FLOOR;
         const noise = dark ? noiseDark : noiseBright;
-        if (c.maxContrast < Math.max(floor, noise*MIN_CONTRAST_K)){ rejected.weak++; return; }
+        // Contrast is measured against a background that excludes vessels, so a
+        // vessel scores well on it simply for being a vessel. A candidate on the
+        // vasculature therefore has to clear a higher bar than one in open
+        // retina before the same figure means the same thing.
+        const bar = Math.max(floor, noise*MIN_CONTRAST_K) * (onVessel ? ON_VESSEL_CONTRAST_FACTOR : 1);
+        if (c.maxContrast < bar){ rejected.weak++; return; }
 
         let type;
         if (dark){
@@ -1620,7 +1978,7 @@
         } else {
           rejected.weak++; return;
         }
-        candidates.push(Object.assign(c, { type }));
+        candidates.push(Object.assign(c, { type, onVessel }));
         for (let i=0;i<c.pixels.length;i++) covered[c.pixels[i]] = 1;
       });
     }
@@ -1647,12 +2005,15 @@
 
     const counts = {};
     LESION_ORDER.forEach(k => counts[k] = 0);
-    let lesionPixels = 0;
-    candidates.forEach(c => { counts[c.type.key]++; lesionPixels += c.area; });
+    let lesionPixels = 0, onVesselCount = 0;
+    candidates.forEach(c => {
+      counts[c.type.key]++; lesionPixels += c.area;
+      if (c.onVessel) onVesselCount++;
+    });
 
     return {
       candidates, counts, rejected, w, h,
-      retinaArea, lesionPixels,
+      retinaArea, lesionPixels, onVesselCount,
       noise: { dark: noiseDark, bright: noiseBright },
       scales,
       discExcluded: !!anatomy,
@@ -1909,6 +2270,18 @@
     drawn.forEach(c => {
       const r = Math.max(5, Math.sqrt(c.area/Math.PI)*1.9);
       drawLesionMarker(ctx, c.type.shape, c.cx, c.cy, r);
+      // A candidate lying along a vessel gets a tick through its marker. It is
+      // still a candidate — a microaneurysm beside a venule is real — but a
+      // reader deciding whether a mark is a lesion or a wide spot in the vessel
+      // it sits on needs to be told which it is, and the mask alone cannot say.
+      if (c.onVessel){
+        ctx.save();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(c.cx-r*0.75, c.cy+r*0.75); ctx.lineTo(c.cx+r*0.75, c.cy-r*0.75); ctx.stroke();
+        ctx.strokeStyle = "#000"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(c.cx-r*0.75, c.cy+r*0.75); ctx.lineTo(c.cx+r*0.75, c.cy-r*0.75); ctx.stroke();
+        ctx.restore();
+      }
       const seen = labelledPerType[c.type.key] || 0;
       if (seen < labelLimit){
         labelledPerType[c.type.key] = seen+1;
@@ -1926,7 +2299,12 @@
       const t = LESION_TYPES[k];
       const g = `rgb(${t.grey},${t.grey},${t.grey})`;
       return `<div class="legend-row"><span class="swatch" style="background:${g}"></span>${t.label} — <strong>${lesions.counts[k]}</strong> · drawn as a ${t.shapeName} on the fundus overlay, labelled <code>${t.key}</code></div>`;
-    }).join("");
+    }).join("") +
+      `<div class="legend-row"><span class="swatch" style="background:transparent;position:relative">` +
+      `<span style="position:absolute;left:-1px;top:6px;width:15px;height:1px;background:#000;` +
+      `display:block;transform:rotate(-45deg)"></span></span>` +
+      `A marker struck through — <strong>${lesions.onVesselCount || 0}</strong> · the candidate lies along the course of a vessel. ` +
+      `It is kept, because a microaneurysm beside a venule is a real and common finding, but it is held to a stricter contrast bar and flagged here because a wide spot in a vessel looks the same.</div>`;
 
     const summary = document.getElementById("lesion-summary");
     const pctOfRetina = lesions.retinaArea ? (lesions.lesionPixels/lesions.retinaArea)*100 : 0;
@@ -1936,7 +2314,8 @@
       const noisy = total > NOISE_SUSPICION_COUNT;
       const capped = total > OVERLAY_CIRCLE_LIMIT;
       summary.innerHTML = `<p><strong>${total} candidate region${total===1?"":"s"}</strong> covering ${lesions.lesionPixels.toLocaleString()} px, ${pctOfRetina.toFixed(2)}% of the retinal area.
-        Rejected during filtering: ${lesions.rejected.vessel} as vessel or vessel fragment, ${lesions.rejected.weak} as too faint against the noise floor, ${lesions.rejected.tooLarge} as too large, ${lesions.rejected.tooSmall} as too small, ${lesions.rejected.streak} as bright streaks, ${lesions.rejected.disc} inside the optic disc, ${lesions.rejected.edge} as large regions at the edge of the aperture, ${lesions.rejected.macula} as macular pigmentation, ${lesions.rejected.smooth} as broad smooth shading, ${lesions.rejected.noSeed} for having no core strong enough to seed a region.
+        Rejected during filtering: ${lesions.rejected.vessel} as vessel or vessel fragment, ${lesions.rejected.junction} as vessel crossings, bifurcations or bends, ${lesions.rejected.weak} as too faint against the noise floor, ${lesions.rejected.tooLarge} as too large, ${lesions.rejected.tooSmall} as too small, ${lesions.rejected.streak} as bright streaks, ${lesions.rejected.disc} inside the optic disc, ${lesions.rejected.edge} as large regions at the edge of the aperture, ${lesions.rejected.macula} as macular pigmentation, ${lesions.rejected.smooth} as broad smooth shading, ${lesions.rejected.noSeed} for having no core strong enough to seed a region.
+        ${lesions.onVesselCount ? `<strong>${lesions.onVesselCount}</strong> of them lie along a vessel and are struck through on the overlay — treat those with extra caution.` : ""}
         ${capped ? `The fundus overlay rings the ${OVERLAY_CIRCLE_LIMIT} largest; both mask canvases show all of them.` : ""}
         ${lesions.discExcluded ? "" : "<em>Optic disc position was unavailable, so the disc was not excluded and its bright pixels may appear as exudate candidates.</em>"}
         ${lesions.maculaExcluded ? "" : "<em>Macula position was unavailable, so normal macular darkening may appear here as a large dark candidate.</em>"}</p>`
@@ -2070,9 +2449,11 @@
   function redrawCamRegions(sourceCanvas, cam, anatomy, desc){
     const gcCanvas = document.getElementById("canvas-gradcam");
     const gcColour = document.getElementById("canvas-gradcam-colour");
-    renderGradCAMOverlay(sourceCanvas, cam.camArray, cam.h, cam.w, gcCanvas);
-    renderGradCAMColour(sourceCanvas, cam.camArray, gcColour);
-    const blobs = findDefectBlobs(cam.camArray, cam.h, cam.w, BLOB_THRESHOLD, BLOB_MIN_AREA_FRAC);
+    renderGradCAMOverlay(sourceCanvas, cam.camArray, cam.h, cam.w, gcCanvas, cam.inside, cam.feather);
+    renderGradCAMColour(sourceCanvas, cam.camArray, gcColour, cam.inside, cam.feather);
+    drawFieldBoundary(gcCanvas, cam.field);
+    drawFieldBoundary(gcColour, cam.field);
+    const blobs = findDefectBlobs(cam.camArray, cam.h, cam.w, BLOB_THRESHOLD, BLOB_MIN_AREA_FRAC, cam.inside, cam.stats);
     const marked = drawDefectMarkers(gcCanvas, blobs, anatomy);
     drawDefectMarkers(gcColour, blobs, anatomy);
     state.lastFindings = marked.findings;
@@ -2082,6 +2463,19 @@
     const ln = document.getElementById("cam-layer-name");
     if (ln && state.camLayerName) ln.textContent = state.camLayerName;
     return marked;
+  }
+
+  // The edge of the region the map was measured and scaled over. Drawn dashed
+  // and labelled, in the same idiom the app uses everywhere else for something
+  // estimated rather than known.
+  function drawFieldBoundary(targetCanvas, field){
+    if (!field) return;
+    const ctx = targetCanvas.getContext("2d");
+    const fontPx = Math.max(10, Math.round(targetCanvas.width*0.022));
+    strokeCircle(ctx, field.cx, field.cy, field.r, [6,5]);
+    haloText(ctx, "analysed field", field.cx,
+      clamp(field.cy - field.r - 3, fontPx, targetCanvas.height-2),
+      "center", "bottom", false, fontPx);
   }
 
   function renderGradCAMStep(desc, findings, anatomy){
@@ -2096,9 +2490,13 @@
 
     const countText = findings && findings.length
       ? `${findings.length} region${findings.length === 1 ? " is" : "s are"} marked on the gradient above.`
-      : `No discrete region passed the marking threshold.`;
+      : (desc.flat
+          ? `No region is marked. The map is warm across the whole retina rather than peaked anywhere in it, so there is no hotspot to circle. Grad-CAM is always scaled to its own maximum, which means something always reaches full intensity — marking it here would invent a localisation the model did not make.`
+          : `No region is marked: nothing rose far enough above the retina's own background activation to count as a hotspot.`);
 
-    note.innerHTML = `Peak Grad-CAM activation falls in the <strong>${desc.region}</strong> quadrant. ${countText} Attention is ${focalText} ${quadrantSource}`;
+    const fieldNote = `Activation is measured over the retina only, inside the dashed circle. The map is masked to the fitted camera aperture, trimmed by half a Grad-CAM cell, and rescaled inside that mask — so the black surround can neither be marked as a finding nor set the scale everything else is judged against. The rim outside the dashed circle is real retina that is deliberately not judged: at this layer's resolution a cell straddling the aperture edge is computed mostly from the black surround, so its value says nothing about retina. Nothing there is assessed, and nothing there is ruled out.`;
+
+    note.innerHTML = `Peak Grad-CAM activation falls in the <strong>${desc.region}</strong> quadrant. ${countText} Attention is ${focalText} ${quadrantSource} ${fieldNote}`;
   }
 
   // ---------------------------------------------------------------------
@@ -2170,7 +2568,9 @@
           `<tr><td>Marked region ${f.index}</td><td>${f.quadrant} quadrant · peak ${(f.peak*100).toFixed(0)}% of maximum · ${f.areaPct.toFixed(1)}% of frame</td></tr>`
         ).join("") + `</table>`;
       } else {
-        html += `<p class="small">No discrete region passed the marking threshold.</p>`;
+        html += `<p class="small">${gc.flat
+          ? "No region marked — activation is spread across the whole retina rather than peaked anywhere in it, so there is no hotspot to localise."
+          : "No region marked — nothing rose far enough above the retina's own background activation to count as a hotspot."} Activation is measured over the retina only; the black surround outside the camera aperture is excluded and cannot be marked.</p>`;
       }
       if (state.lastAnatomy){
         const a = state.lastAnatomy;
@@ -2327,7 +2727,7 @@
         const cam = await computeGradCAM(procCanvas, 1);
 
         // 3a: gradient overlay, then circle the connected high-activation regions
-        const desc = describeGradCAM(cam.camArray, cam.h, cam.w, anatomy);
+        const desc = describeGradCAM(cam, anatomy);
         state.lastGradcamDesc = desc;
         state.lastCam = cam;
         const marked = redrawCamRegions(procCanvas, cam, anatomy, desc);

@@ -151,3 +151,79 @@
     .refer-banner{position:static;display:block !important;max-width:100%;
       background:#fff;color:#000;border:2px solid #000;box-shadow:none;margin:1rem 0;}
   }
+
+  /* ---- capacity model page --------------------------------------------
+     This page is the one place in the project that is deliberately colourful.
+     The colour is not decoration: every hue on it is a utilisation reading,
+     demand divided by capacity at one stage, on a single scale that is printed
+     beside the diagram so the tones can be read rather than guessed. Colour
+     never carries a fact on its own here — the choke point is also labelled,
+     also outlined heavily, and also listed in the table underneath, so the page
+     works in greyscale and for a colour-blind reader. ---- */
+  .wrap-wide{max-width:1120px;}
+  .model-grid{display:grid;grid-template-columns:minmax(0,1fr) 19rem;gap:1.75rem;align-items:start;}
+  @media (max-width:900px){ .model-grid{grid-template-columns:minmax(0,1fr);} }
+  .controls{border:1px solid var(--ink);padding:1rem 1.1rem;
+    position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow-y:auto;}
+  @media (max-width:900px){ .controls{position:static;max-height:none;} }
+  .controls h3{margin-top:0;}
+  .controls label.field{flex-direction:column;align-items:stretch;gap:.15rem;margin:.55rem 0;}
+  .controls label.field input{width:100%;}
+  .controls .grp{border-top:1px solid var(--grey2);margin-top:.9rem;padding-top:.5rem;}
+  .controls .grp:first-of-type{border-top:none;margin-top:0;}
+  .grp-title{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--grey4);
+    font-weight:700;margin:.2rem 0 .1rem;}
+
+  .flowchart{width:100%;height:auto;display:block;margin:.25rem 0 .5rem;
+    border:1px solid var(--ink);background:var(--paper);}
+  .flowchart text{font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  /* Fill and stroke are set per block from its utilisation, so they are left out
+     of the class deliberately: a class selector outranks a presentation
+     attribute, and declaring them here would silently override every computed
+     colour with a flat white box. */
+  .flowchart .blk{stroke-width:1.5;}
+  .flowchart .blk-choke{stroke-width:4;}
+  .flowchart .hdr-t{font-size:11.5px;font-weight:700;letter-spacing:.01em;}
+  .flowchart .b-lbl{font-size:11px;fill:#111;}
+  .flowchart .b-num{font-size:12.5px;font-weight:700;fill:#111;}
+  .flowchart .b-sub{font-size:9.5px;fill:#5a5a5a;}
+  .flowchart .wire{fill:none;stroke:#111;stroke-linejoin:round;}
+  .flowchart .wire-lbl{font-size:9.5px;fill:#3a3a3a;}
+  .flowchart .sink{fill:#f4f4f4;stroke:#6b6b6b;stroke-width:1.5;stroke-dasharray:5 3;}
+  .flowchart .choke-badge{font-size:9.5px;font-weight:700;letter-spacing:.06em;fill:#fff;}
+
+  .util-scale{display:flex;align-items:center;gap:.5rem;margin:.4rem 0 .1rem;}
+  .util-bar{flex:1;height:13px;border:1px solid var(--ink);background:linear-gradient(to right,
+    #0d7a63 0%, #2f8f2f 42%, #e0a900 63%, #e8631a 79%, #c00000 100%);}
+  .util-ticks{display:flex;justify-content:space-between;font-size:.72rem;color:var(--grey4);}
+
+  .stage-table{width:100%;border-collapse:collapse;font-size:.84rem;margin:.6rem 0 1rem;}
+  .stage-table th,.stage-table td{border:1px solid var(--grey2);padding:.42rem .55rem;text-align:left;}
+  .stage-table th{background:var(--grey1);font-weight:700;}
+  .stage-table td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  .stage-table tr.choke td{font-weight:700;background:#fff4f4;}
+  .stage-table tr.choke td:first-child{box-shadow:inset 4px 0 0 #c00000;}
+  .util-chip{display:inline-block;min-width:3.6rem;text-align:center;padding:.1rem .45rem;
+    border:1px solid rgba(0,0,0,.35);font-weight:700;font-size:.8rem;border-radius:2px;}
+
+  .verdict{border:2px solid var(--ink);padding:1rem 1.1rem;margin:.9rem 0;}
+  .verdict .headline{font-size:1.2rem;font-weight:700;line-height:1.25;margin:0 0 .35rem;}
+  .verdict .headline .who{padding:.05rem .4rem;border-radius:2px;}
+  .verdict ul{margin:.5rem 0 0;padding-left:1.15rem;font-size:.86rem;}
+  .verdict li{margin:.2rem 0;}
+
+  .relief-list{list-style:none;padding:0;margin:.4rem 0 0;font-size:.85rem;}
+  .relief-list li{display:flex;align-items:center;gap:.6rem;margin:.3rem 0;}
+  .relief-rank{width:1.4rem;height:1.4rem;flex-shrink:0;border:1px solid var(--ink);
+    display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:700;}
+
+  .backlog-chart{width:100%;height:auto;display:block;border:1px solid var(--ink);margin:.4rem 0;}
+  .backlog-chart text{font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:10px;fill:#5a5a5a;}
+  .backlog-chart .axis{stroke:#bdbdbd;stroke-width:1;}
+  .backlog-chart .zero{stroke:#111;stroke-width:1;}
+
+  @media print{
+    .controls{page-break-inside:avoid;position:static;max-height:none;overflow:visible;}
+    .model-grid{grid-template-columns:1fr;}
+  }

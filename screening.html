@@ -12,6 +12,7 @@
     <span class="brand">DR Screening &middot; SIH26038</span>
     <a href="index.html">Overview</a>
     <a href="screening.html" aria-current="page">Run screening</a>
+    <a href="pipeline.html">Capacity model</a>
     <a href="reference.html">Clinical reference</a>
   </nav>
 
@@ -165,7 +166,7 @@
     <hr class="rule">
     <span class="pill">Step 6</span>
     <h2>Screening throughput simulation</h2>
-    <p class="notice">This step is a planning simulation, not part of the AI model. A production version of this analysis would be built as a Simulink model in MATLAB; this is a lightweight JavaScript stand-in for planning purposes only.</p>
+    <p class="notice">This step is a planning simulation, not part of the AI model. A production version of this analysis would be built as a Simulink model in MATLAB; this is a lightweight JavaScript stand-in for planning purposes only. The quick version is here; the <a href="pipeline.html">capacity model</a> is the full one &mdash; a Simulink-style block diagram of the whole service, colour-coded by how hard each stage is being pushed, that names the single stage choking the programme and what happens once you relieve it.</p>
 
     <label class="field">Image acquisition rate (images/day)
       <input type="number" id="in-acquisition" value="200" min="1"></label>

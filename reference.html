@@ -12,6 +12,7 @@
     <span class="brand">DR Screening &middot; SIH26038</span>
     <a href="index.html">Overview</a>
     <a href="screening.html">Run screening</a>
+    <a href="pipeline.html">Capacity model</a>
     <a href="reference.html" aria-current="page">Clinical reference</a>
   </nav>
 
@@ -105,7 +106,10 @@
     <h3>6. Throughput planning</h3>
     <p>A deliberately simple capacity model, not part of the AI at all. It takes acquisition rate,
     bandwidth, measured model speed and reviewer capacity, and reports which stage is the bottleneck.
-    A production version of this would be a Simulink model.</p>
+    A production version of this would be a Simulink model. The full version lives on the
+    <a href="pipeline.html">capacity model</a> page: a Simulink-style block diagram of the whole
+    service, coloured by how hard each stage is being pushed, which names the single stage choking
+    the programme and what becomes the limit once it is relieved.</p>
 
     <hr class="rule-light">
     <h3>What the lesion detector cannot do</h3>
