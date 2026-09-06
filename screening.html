@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Run screening — Diabetic Retinopathy</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="site-nav">
+    <span class="brand">DR Screening &middot; SIH26038</span>
+    <a href="index.html">Overview</a>
+    <a href="screening.html" aria-current="page">Run screening</a>
+    <a href="reference.html">Clinical reference</a>
+  </nav>
+
+<header class="app-header">
+    <h1>Diabetic Retinopathy Screening</h1>
+    <p class="subtitle">Prototype for SIH26038 (sponsor: MathWorks) — client-side screening, explainability and throughput planning for primary health centre fundus photography.</p>
+    <div id="model-status">Loading classifier model…</div>
+    <progress id="model-progress" max="1"></progress>
+  </header>
+
+<section id="uploader">
+    <h2>1. Upload a fundus image</h2>
+    <div class="upload-box">
+      <input type="file" id="file-input" accept="image/*">
+      <div class="actions">
+        <button id="run-button" disabled>Run screening pipeline</button>
+      </div>
+      <p class="field-note">Images are downsampled to a maximum of 800px on the longest side before processing, for speed. Nothing is uploaded anywhere — all computation runs in this browser tab.</p>
+    </div>
+  </section>
+
+<section id="step1" class="step">
+    <hr class="rule">
+    <span class="pill">Step 1</span>
+    <h2>Image quality assessment &amp; enhancement</h2>
+    <div class="canvas-row">
+      <div class="canvas-col"><canvas id="canvas-original"></canvas><div class="cap">As uploaded (resized for processing)</div></div>
+      <div class="canvas-col"><canvas id="canvas-enhanced"></canvas><div class="cap">After enhancement (if applied)</div></div>
+    </div>
+    <table class="kv" id="quality-table"></table>
+    <div id="quality-notice"></div>
+    <p class="small">Focus, brightness and field-of-view are computed directly from pixel data (Laplacian-variance focus measure, greyscale histogram mean/spread, non-black pixel fraction). Thresholds below are prototype heuristics for this build, not clinically validated cutoffs.</p>
+  </section>
+
+<section id="step2" class="step">
+    <hr class="rule">
+    <span class="pill">Step 2</span>
+    <h2>DR classification</h2>
+    <div id="model-scope-notice" class="notice"></div>
+    <div id="grading-results"></div>
+  </section>
+
+<section id="step3" class="step">
+    <hr class="rule">
+    <span class="pill">Step 3</span>
+    <h2>Explainability — Grad-CAM</h2>
+
+    <h3>3a. Attention gradient with marked regions</h3>
+    <div class="canvas-row">
+      <div class="canvas-col"><canvas id="canvas-gradcam-colour"></canvas><div class="cap">Grad-CAM in colour tones</div></div>
+      <div class="canvas-col"><canvas id="canvas-gradcam"></canvas><div class="cap">The same gradient in greyscale</div></div>
+    </div>
+    <div class="cbar"></div>
+    <div class="cbar-ends"><span>low attention</span><span>high attention</span></div>
+    <p class="small">Both panels show the same Grad-CAM values; only the palette differs. The colour version is the conventional way this is displayed and is easier to read tones from at a glance. The greyscale version is kept because a printed report reproduces it reliably and because colour maps of this kind exaggerate boundaries that are not really there in the data. Neither adds information the other lacks.</p>
+    <div class="tune-box">
+      <h3 style="margin-top:0">Attention regions</h3>
+      <p class="small">Grad-CAM at this model's resolution is coarse, so these control how finely its attention map is broken into separate regions. They re-draw the panels above without re-running the model.</p>
+      <label class="field">Attention threshold (fraction of peak)
+        <input type="number" id="tune-cam-threshold" value="0.5" step="0.05" min="0.15" max="0.95"></label>
+      <div class="field-note">Lower marks more, smaller regions. Raise it to keep only the strongest.</div>
+      <label class="field">Maximum regions marked
+        <input type="number" id="tune-cam-limit" value="12" step="1" min="1" max="40"></label>
+      <div class="actions"><button id="rerun-cam">Re-draw regions</button></div>
+    </div>
+    <div id="findings-legend"></div>
+    <p id="gradcam-note"></p>
+    <p class="small">Computed from real gradients of the loaded model's output with respect to an internal convolutional layer (<span id="cam-layer-name">conv_pw_11_relu</span>), following the standard Grad-CAM formulation. The very last convolutional layer is only 7&times;7 at this model's input size, which spreads into roughly 114-pixel blocks once scaled up and is why an attention map of this kind can look rectangular; the layer used here is 14&times;14, halving that. It is still coarse, and a region boundary should be read as "somewhere around here" rather than as an outline. Always computed for the "DR present" class score, so it shows evidence the model finds for disease even when its final prediction is "No DR". Marked regions are connected components of the gradient above <span id="blob-threshold-text">60%</span> of peak activation, filtered to remove specks. They mark <em>where the model looked</em>, which is not the same as a confirmed lesion.</p>
+
+    <h3>3b. Anatomical landmarks and retinal quadrants</h3>
+    <div class="canvas-row">
+      <div class="canvas-col"><canvas id="canvas-anatomy"></canvas><div class="cap">Estimated landmarks with quadrant axes centred on the optic disc.</div></div>
+    </div>
+    <table class="kv" id="anatomy-table"></table>
+    <p class="small"><strong>How these are found.</strong> The optic disc is scored on brightness <em>and</em> local contrast together, because the disc carries the vessel trunk and a sharp rim and is therefore bright and textured, while lens flare and blown-out patches are bright and smooth. Scoring on brightness alone hands the disc to any highlight in the frame. The centre is the centroid of the bright plateau rather than a single peak pixel, and the radius is measured from that plateau instead of assumed. The fovea is found by combining anatomy with evidence rather than relying on either alone. The vessels are first removed outright by a morphological closing, which deletes dark structures thinner than the filter instead of merely diluting them the way a blur does; without this the darkest region found is usually a vessel bundle, not the macula. The remaining broad darkening is then scored against an anatomical anchor: the fovea sits about two and a half disc diameters temporal to the disc and slightly below its level, so candidate positions are weighted by their distance from that expected point. Darkness alone let any dark structure in the search window capture the marker, which is what sent it into the inferior retina and then to the upper temporal region. The anchor holds the estimate where the fovea has to be while genuine macular darkening still moves it, and when there is no dark signal at all it degrades gracefully to the anatomical position instead of snapping to noise. The table above records which method actually produced the position, since the geometric fallback is used when no dark region is found.</p>
+    <p class="small"><strong>Where this still fails.</strong> A large hemorrhage or a dark pigment patch inside the search zone can be darker than the true fovea and will capture the marker. A mislocated disc puts the search cone in the wrong place, and every downstream quadrant name inherits that error. Heavy vignetting, a disc cropped at the frame edge, or a photograph centred somewhere other than the posterior pole all degrade it. This is a heuristic, not a trained landmark detector, and nothing here is validated against annotated landmark positions. Because the optic disc lies <em>nasal</em> to the fovea in both eyes, the nasal/temporal axis follows from the measured disc-to-fovea vector and needs no left/right eye information. Superior is taken as the top of the frame, per normal fundus photography convention. Use these for orientation, not measurement.</p>
+  </section>
+
+<section id="step4" class="step">
+    <hr class="rule">
+    <span class="pill">Step 4</span>
+    <h2>Lesion candidate mask</h2>
+    <p class="notice"><strong>This is classical image processing, not the neural network.</strong> The mask below is produced by morphology on the pixels — local background subtraction, then shape and contrast filtering. It is independent of the classifier in Step 2, it did not influence the grade, and the grade did not influence it. Every region is a <em>candidate</em>, not a confirmed lesion.</p>
+
+    <div class="canvas-row">
+      <div class="canvas-col"><canvas id="canvas-mask"></canvas><div class="cap">Binary mask — white pixels are candidate lesion pixels</div></div>
+      <div class="canvas-col"><canvas id="canvas-mask-typed"></canvas><div class="cap">Same mask, shaded by candidate type</div></div>
+      <div class="canvas-col"><canvas id="canvas-lesion-overlay"></canvas><div class="cap">Candidates located on the fundus image</div></div>
+    </div>
+
+    <div id="lesion-legend"></div>
+    <div id="lesion-summary"></div>
+    <div id="lesion-quadrants"></div>
+
+    <div class="tune-box">
+      <h3 style="margin-top:0">Detection sensitivity</h3>
+      <p class="small">These are the thresholds the detector actually uses, exposed because the right values depend on your camera and your images, and no single default suits every set. Changing them re-runs only this step, not the model.</p>
+      <label class="field">Dark-lesion sensitivity
+        <input type="number" id="tune-dark" value="8" step="0.5" min="1" max="40"></label>
+      <div class="field-note">How strong the response must be before a dark region counts as a lesion. <strong>Lower finds fainter microaneurysms and hemorrhages, and more noise with them.</strong></div>
+      <label class="field">Bright-lesion sensitivity
+        <input type="number" id="tune-bright" value="10" step="0.5" min="1" max="40"></label>
+      <div class="field-note">The same, for exudates. Lower to recover faint or small exudates that are being missed.</div>
+      <label class="field">Minimum contrast above noise
+        <input type="number" id="tune-contrast" value="3" step="0.1" min="0.5" max="10"></label>
+      <div class="field-note">How far a region must stand clear of the image's own noise level. <strong>Raise this first if you are getting marks on plain retina</strong>, before touching the two above.</div>
+      <div class="actions"><button id="rerun-detection">Re-run detection</button></div>
+    </div>
+
+    <h3>How each type is decided</h3>
+    <table class="kv" id="lesion-rules">
+      <tr><td>Microaneurysm candidate</td><td>Small, round, isolated region darker than its local background. Separated from a hemorrhage by area alone, which is the weakest of these rules.</td></tr>
+      <tr><td>Dot/blot hemorrhage candidate</td><td>Same darkness test, larger area, still compact rather than elongated.</td></tr>
+      <tr><td>Hard exudate candidate</td><td>Region brighter than local background with a sharp edge, measured as mean gradient magnitude across the region.</td></tr>
+      <tr><td>Cotton wool spot candidate</td><td>Brighter than local background, soft low-gradient edge, and at least a quarter of a disc diameter across. <strong>This is the least trustworthy class here.</strong> A soft edge is also what a defocused exudate, a haze artefact, or a smudge on the lens looks like, and edge sharpness alone cannot separate them. Treat any region marked this way as unidentified bright material rather than as a cotton wool spot.</td></tr>
+      <tr><td>Growth stops at vessels</td><td>A region may not grow across a vessel. A lesion lying on one is identified correctly, but the permissive mask covers the vessel too, so without this the region ran out along the whole vessel tree and was then discarded as too large, taking the lesion with it. Vessel pixels are removed from what a region may grow into; the lesion's own pixels are not among them, because a lesion answers the directional test strongly and that is what keeps it out of the vessel map.</td></tr>
+      <tr><td>Nothing seeded is ever dropped</td><td>If a region fails a size or shape test, the seed inside it is reconsidered on its own extent rather than discarded. The evidence for a lesion is the seed, not how far the region grew, so the worst outcome is a lesion reported slightly smaller than it is, never one that vanishes.</td></tr>
+      <tr><td>Rejected as vessel</td><td>Nothing is rejected as a vessel any more. Vessels simply never become candidates, because what marks a region as a lesion is a response to <em>elongation</em> rather than to darkness. A vessel is longer than the measuring element along the direction it runs, so it survives that direction's test; a lesion is shorter than it in every direction and responds to all of them. A lesion lying on a vessel is still round, so it is still found.</td></tr>
+      <tr><td>The macula, and broad shading</td><td>Also never becomes a candidate, and for the same reason rather than by being masked out by position. The response measures how steeply intensity changes across the measuring element, so a lesion's step edge answers strongly while the macula's gradual ramp barely answers at all, however much darker the macula is overall. Nothing is blanked out by location, so a discrete lesion inside the macula is still reported — which matters, since that is the most sight-threatening place for one to be.</td></tr>
+      <tr><td>Rejected as too faint</td><td>Peak region contrast that clears the threshold but not the image's own measured noise level. Peak rather than average, because a region grown out to its faint margins has a mean that understates its core.</td></tr>
+      <tr><td>Rejected for no strong core</td><td>A region found only at the permissive threshold, with no pixel anywhere in it reaching the strict one. Background texture behaves exactly this way, which is what keeps it out.</td></tr>
+      <tr><td>Rejected as optic disc</td><td>Bright <em>and</em> dark regions within the estimated disc from Step 3b. The disc is the brightest structure in a normal retina, and the vessels converging on it plus its dark cup would otherwise produce both kinds of false candidate.</td></tr>
+    </table>
+    <p class="small">The background each pixel is compared against excludes both the black surround and the vessels. Leaving vessels in drags the local background down wherever they run, so ordinary retina lying between two vessels reads as abnormally bright and appears as a soft-edged bright finding along the arcades. The background each pixel is compared against is computed from retinal pixels only. A plain neighbourhood average near the field-of-view rim mixes in the black surround, which drags the local background down and makes ordinary edge retina read as abnormally bright. Left uncorrected, that alone produces a ring of spurious bright findings around the border of every image.</p>
+    <p class="small">What counts as a lesion is decided by directional morphology. The whole detector is tested end to end against a synthetic retina carrying vessels at four angles, lesions from microaneurysm to blot-hemorrhage size, a hemorrhage lying on <em>each</em> vessel, an exudate cluster, and a macula: twenty-one checks covering both what must be found and what must not be. Testing only the seeding stage was not enough and let a real fault through, where seeding was right but the region then grew along the vessel and was discarded on size. A simpler version of this test using a square measuring element failed outright: a square removes everything smaller than itself, and a microaneurysm is smaller than a vessel is wide, so every small lesion was being classified as vessel and discarded. Size cannot separate the two. Only elongation can.</p>
+    <p class="small">Regions are found by hysteresis rather than one cut-off. A region has to contain a pixel clearing a strict threshold before it exists at all, and it is then grown outward to a much lower one. This is what recovers a cluster whose members are individually faint, and the faded margins of a lesion whose centre is obvious, without letting texture in: texture never produces a core strong enough to start a region, so it is never grown. A single threshold forces a choice between the two, which is why raising it to remove false marks previously also removed real clusters.</p>
+    <p class="small">Detection runs at three background scales. A single scale is blind to any lesion larger than its own window, because a large lesion contaminates the background estimate it is being compared against and its apparent contrast collapses. That is the usual reason a detector of this kind misses large hemorrhages while finding small ones. Confluent clusters fail the same way for a subtler reason: neighbouring lesions raise each other's local background, so a tight group of exudates fades out together even though each one is obvious to the eye. The coarsest scale measures the group against general retina instead of against its own neighbours. Thresholds are multiples of a median-absolute-deviation noise estimate rather than a standard deviation, because the vessel tree is a large population of strong dark deviations that inflates the standard deviation and pushes the threshold above real lesions.</p>
+
+    <h3>What this method cannot do</h3>
+    <p class="small">These limits are structural, not tuning problems. <strong>Flame-shaped hemorrhages and neovascularization are largely invisible to it</strong> — both are elongated, so the vessel-rejection test discards them, which means the findings that define proliferative DR are exactly the ones this method misses. <strong>It cannot separate a true microaneurysm from dust on the lens, sensor noise, or a dark pigment spot</strong>, because at this resolution they are the same few dark pixels. <strong>Venous beading and IRMA are not detected at all</strong>, as both require judging vessel calibre along its length. <strong>The microaneurysm versus hemorrhage split rests on area alone</strong> and will misassign borderline sizes. Classical detectors of this kind are known for high false-positive rates on anything but clean images, and this one has not been validated against ground-truth lesion masks, so no sensitivity or specificity is claimed. Sensitivity and precision trade directly against each other here: every threshold that suppresses a false mark on background texture also raises the contrast a faint real lesion must reach to be seen. There is no setting that fixes both, only a choice about which error you would rather have. It runs on the enhanced image, which raises contrast for detection but can also amplify noise into candidates. Treat the mask as a prompt for where to look, never as a finding.</p>
+    <h3>Replacing this with a trained model</h3>
+    <p class="small">A learned segmentation model would outperform everything above, and a suitable one already exists rather than needing to be trained from scratch: <a href="https://huggingface.co/ClementP/fundus-lesions-segmentation-unet_seresnext50_32x4d" target="_blank" rel="noopener">ClementP/fundus-lesions-segmentation-unet_seresnext50_32x4d</a> on Hugging Face is a U-Net with a SE-ResNeXt50 encoder trained on DDR, FGADR, IDRiD, MESSIDOR and RETLES, under an MIT licence.</p>
+    <p class="small">It cannot be loaded here as things stand. It ships as PyTorch <code>safetensors</code>, and a browser cannot run those. Reaching this page needs three steps on a machine with Python and PyTorch: export the checkpoint to ONNX, then either serve it with ONNX Runtime Web or convert it onward to TensorFlow.js, and host the result at a URL that permits cross-origin requests, as the classifier in Step 2 already is. None of that can happen inside a single HTML file, which is why the morphological detector is what runs today. The honest summary is that the accurate option is a packaging problem rather than a research one.</p>
+  </section>
+
+<section id="step5" class="step">
+    <hr class="rule">
+    <span class="pill">Step 5</span>
+    <h2>Screening throughput simulation</h2>
+    <p class="notice">This step is a planning simulation, not part of the AI model. A production version of this analysis would be built as a Simulink model in MATLAB; this is a lightweight JavaScript stand-in for planning purposes only.</p>
+
+    <label class="field">Image acquisition rate (images/day)
+      <input type="number" id="in-acquisition" value="200" min="1"></label>
+    <label class="field">Network bandwidth available for transfer (Mbps)
+      <input type="number" id="in-bandwidth" value="10" min="0.1" step="0.1"></label>
+    <label class="field">Average image file size (MB)
+      <input type="number" id="in-imgsize" value="2" min="0.1" step="0.1"></label>
+    <div class="field-note">Transfer capacity is derived from bandwidth and image size, assumed available 24 hours/day.</div>
+
+    <label class="field">Model processing throughput (images/min)
+      <input type="number" id="in-modelrate" value="6" min="0.01" step="0.01"></label>
+    <div class="field-note" id="modelrate-note">Default value — will be replaced with a rate measured live from this session's actual inference time once you run the pipeline above.</div>
+
+    <label class="field">Ophthalmologist review capacity (reviews/day)
+      <input type="number" id="in-review" value="150" min="1"></label>
+
+    <label class="field">Target population to screen (people/year)
+      <input type="number" id="in-target" value="100000" min="1"></label>
+
+    <div class="actions"><button id="calc-throughput">Calculate</button></div>
+
+    <div id="throughput-results"></div>
+  </section>
+
+<section id="report" class="step">
+    <hr class="rule">
+    <span class="pill">Summary</span>
+    <h2>Screening report</h2>
+    <div class="actions no-print"><button id="print-button">Print report</button></div>
+    <div id="report-body"></div>
+  </section>
+
+<footer class="app-footer">
+    <p>Classifier: MobileNet-based binary diabetic-retinopathy detector converted to TensorFlow.js by
+    <a href="https://github.com/vbookshelf/Diabetic-Retinopathy-Analyzer" target="_blank" rel="noopener">vbookshelf/Diabetic-Retinopathy-Analyzer</a>,
+    trained via the Kaggle kernel
+    <a href="https://www.kaggle.com/vbookshelf/dr-mobilenet-binary-classifier-tfjs-web-app" target="_blank" rel="noopener">"DR - MobileNet Binary Classifier + TFJS Web App"</a>
+    on the <a href="https://www.kaggle.com/c/aptos2019-blindness-detection" target="_blank" rel="noopener">APTOS 2019 Blindness Detection</a> dataset. Weights are loaded at runtime from that public repository; no formal peer-reviewed sensitivity/specificity has been published for this exact model, so none is claimed here. This is a research/hackathon prototype, not a certified diagnostic device.</p>
+  </footer>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
