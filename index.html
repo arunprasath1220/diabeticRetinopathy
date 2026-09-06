@@ -194,9 +194,19 @@
     <div class="cbar"></div>
     <div class="cbar-ends"><span>low attention</span><span>high attention</span></div>
     <p class="small">Both panels show the same Grad-CAM values; only the palette differs. The colour version is the conventional way this is displayed and is easier to read tones from at a glance. The greyscale version is kept because a printed report reproduces it reliably and because colour maps of this kind exaggerate boundaries that are not really there in the data. Neither adds information the other lacks.</p>
+    <div class="tune-box">
+      <h3 style="margin-top:0">Attention regions</h3>
+      <p class="small">Grad-CAM at this model's resolution is coarse, so these control how finely its attention map is broken into separate regions. They re-draw the panels above without re-running the model.</p>
+      <label class="field">Attention threshold (fraction of peak)
+        <input type="number" id="tune-cam-threshold" value="0.5" step="0.05" min="0.15" max="0.95"></label>
+      <div class="field-note">Lower marks more, smaller regions. Raise it to keep only the strongest.</div>
+      <label class="field">Maximum regions marked
+        <input type="number" id="tune-cam-limit" value="12" step="1" min="1" max="40"></label>
+      <div class="actions"><button id="rerun-cam">Re-draw regions</button></div>
+    </div>
     <div id="findings-legend"></div>
     <p id="gradcam-note"></p>
-    <p class="small">Computed from real gradients of the loaded model's output with respect to the last convolutional layer (<code>conv_pw_13_relu</code>), following the standard Grad-CAM formulation. Always computed for the "DR present" class score, so it shows evidence the model finds for disease even when its final prediction is "No DR". Marked regions are connected components of the gradient above <span id="blob-threshold-text">60%</span> of peak activation, filtered to remove specks. They mark <em>where the model looked</em>, which is not the same as a confirmed lesion.</p>
+    <p class="small">Computed from real gradients of the loaded model's output with respect to an internal convolutional layer (<span id="cam-layer-name">conv_pw_11_relu</span>), following the standard Grad-CAM formulation. The very last convolutional layer is only 7&times;7 at this model's input size, which spreads into roughly 114-pixel blocks once scaled up and is why an attention map of this kind can look rectangular; the layer used here is 14&times;14, halving that. It is still coarse, and a region boundary should be read as "somewhere around here" rather than as an outline. Always computed for the "DR present" class score, so it shows evidence the model finds for disease even when its final prediction is "No DR". Marked regions are connected components of the gradient above <span id="blob-threshold-text">60%</span> of peak activation, filtered to remove specks. They mark <em>where the model looked</em>, which is not the same as a confirmed lesion.</p>
 
     <h3>3b. Anatomical landmarks and retinal quadrants</h3>
     <div class="canvas-row">
@@ -260,7 +270,9 @@
 
     <h3>What this method cannot do</h3>
     <p class="small">These limits are structural, not tuning problems. <strong>Flame-shaped hemorrhages and neovascularization are largely invisible to it</strong> — both are elongated, so the vessel-rejection test discards them, which means the findings that define proliferative DR are exactly the ones this method misses. <strong>It cannot separate a true microaneurysm from dust on the lens, sensor noise, or a dark pigment spot</strong>, because at this resolution they are the same few dark pixels. <strong>Venous beading and IRMA are not detected at all</strong>, as both require judging vessel calibre along its length. <strong>The microaneurysm versus hemorrhage split rests on area alone</strong> and will misassign borderline sizes. Classical detectors of this kind are known for high false-positive rates on anything but clean images, and this one has not been validated against ground-truth lesion masks, so no sensitivity or specificity is claimed. Sensitivity and precision trade directly against each other here: every threshold that suppresses a false mark on background texture also raises the contrast a faint real lesion must reach to be seen. There is no setting that fixes both, only a choice about which error you would rather have. It runs on the enhanced image, which raises contrast for detection but can also amplify noise into candidates. Treat the mask as a prompt for where to look, never as a finding.</p>
-    <p class="small">A learned segmentation model — a U-Net trained on pixel-level lesion annotations such as IDRiD or DDR — is what would replace this. That is still not present in this prototype, and this morphological stand-in is not a substitute for it.</p>
+    <h3>Replacing this with a trained model</h3>
+    <p class="small">A learned segmentation model would outperform everything above, and a suitable one already exists rather than needing to be trained from scratch: <a href="https://huggingface.co/ClementP/fundus-lesions-segmentation-unet_seresnext50_32x4d" target="_blank" rel="noopener">ClementP/fundus-lesions-segmentation-unet_seresnext50_32x4d</a> on Hugging Face is a U-Net with a SE-ResNeXt50 encoder trained on DDR, FGADR, IDRiD, MESSIDOR and RETLES, under an MIT licence.</p>
+    <p class="small">It cannot be loaded here as things stand. It ships as PyTorch <code>safetensors</code>, and a browser cannot run those. Reaching this page needs three steps on a machine with Python and PyTorch: export the checkpoint to ONNX, then either serve it with ONNX Runtime Web or convert it onward to TensorFlow.js, and host the result at a URL that permits cross-origin requests, as the classifier in Step 2 already is. None of that can happen inside a single HTML file, which is why the morphological detector is what runs today. The honest summary is that the accurate option is a packaging problem rather than a research one.</p>
   </section>
 
   <!-- STEP 5: THROUGHPUT -->
@@ -325,6 +337,12 @@
     "https://raw.githubusercontent.com/vbookshelf/Diabetic-Retinopathy-Analyzer/master/model_dr_2/model.json"
   ];
   const CLASS_NAMES = ["No DR", "DR present"];
+  // Grad-CAM layer. conv_pw_13_relu is the last convolutional layer, but at this
+  // model's 224px input it is only 7x7, so upsampling it to the display gives
+  // roughly 114-pixel cells — the rectangular plateaus that make the heat map look
+  // blocky and put its edges nowhere near any actual lesion. conv_pw_11_relu is the
+  // deepest 14x14 layer, halving the cell size for the same kind of features.
+  const CAM_LAYER_CANDIDATES = ["conv_pw_11_relu", "conv_pw_13_relu"];
   const LAST_CONV_LAYER = "conv_pw_13_relu";
   const GAP_LAYER = "global_average_pooling2d";
   const DENSE_LAYER = "dense";
@@ -334,12 +352,15 @@
   // Grad-CAM region marking: a region is circled when its activation exceeds this
   // fraction of the map's peak and it covers at least this fraction of the frame.
   // Both are display heuristics for legibility, not clinical detection thresholds.
-  const BLOB_THRESHOLD = 0.60;
-  const BLOB_MIN_AREA_FRAC = 0.002;
+  let BLOB_THRESHOLD = 0.50;
+  let BLOB_MIN_AREA_FRAC = 0.0012;
 
   // Most candidates the fundus overlay will ring before it becomes unreadable.
   // The mask canvases are unaffected and always show every candidate pixel.
   const OVERLAY_CIRCLE_LIMIT = 150;
+  // How many attention regions Grad-CAM may mark. The previous cap of five was
+  // hiding real ones on images with widespread disease.
+  let CAM_REGION_LIMIT = 12;
   // Detection sensitivity. Thresholds are multiples of a robust noise estimate,
   // so they follow each image rather than assuming one camera. Lowering DARK_K
   // finds fainter lesions and more noise; MIN_CONTRAST_K is the backstop that
@@ -360,6 +381,13 @@
   // small and soft-edged is far more likely to be defocus or an artefact, so
   // the class carries a size requirement rather than accepting every soft blob.
   const CWS_MIN_AREA_FRAC = 0.0004;
+  // Anything sizeable this far out from the centre of the aperture is an imaging
+  // artifact, not a lesion: shadows from pupil misalignment, peripapillary
+  // crescents and lens flare all live at the edge of the field and can be large.
+  // Genuine peripheral lesions are small, so the rule is keyed on size as well as
+  // position and does not blank out the periphery.
+  const EDGE_ZONE_FRAC = 0.80;
+  const EDGE_ARTIFACT_AREA_FRAC = 0.0015;
   // Hysteresis. A region is found at the strict threshold and then grown out to
   // this fraction of it. Recovers cluster members and faint lesion margins that
   // a single threshold cuts off, without admitting texture, which never produces
@@ -416,12 +444,15 @@
     modelReady: false,
     modelLoadAttempted: false,
     activationModel: null,
+    activationModelLayer: null,
+    camLayerName: null,
     workingCanvas: null,
     procCanvas: null,
     measuredThroughputPerMin: null,
     lastQuality: null,
     lastGrading: null,
     lastGradcamDesc: null,
+    lastCam: null,
     lastAnatomy: null,
     lastFindings: null,
     lastLesions: null,
@@ -751,13 +782,26 @@
   // ---------------------------------------------------------------------
   // GRAD-CAM
   // ---------------------------------------------------------------------
-  async function computeGradCAM(canvas, classIndex){
-    const lastConv = state.model.getLayer(LAST_CONV_LAYER);
-    const gapLayer = state.model.getLayer(GAP_LAYER);
-    const denseLayer = state.model.getLayer(DENSE_LAYER);
+  // Picks the deepest available layer from the candidate list.
+  function camLayerIndex(){
+    const names = state.model.layers.map(l => l.name);
+    for (const cand of CAM_LAYER_CANDIDATES){
+      const i = names.indexOf(cand);
+      if (i >= 0) return i;
+    }
+    return names.indexOf(LAST_CONV_LAYER);
+  }
 
-    if (!state.activationModel){
-      state.activationModel = tf.model({ inputs: state.model.inputs, outputs: lastConv.output });
+  async function computeGradCAM(canvas, classIndex){
+    const layerIdx = camLayerIndex();
+    if (layerIdx < 0) throw new Error("no usable convolutional layer for Grad-CAM");
+    const convLayer = state.model.layers[layerIdx];
+    state.camLayerName = convLayer.name;
+
+    if (!state.activationModel || state.activationModelLayer !== convLayer.name){
+      if (state.activationModel) state.activationModel = null;
+      state.activationModel = tf.model({ inputs: state.model.inputs, outputs: convLayer.output });
+      state.activationModelLayer = convLayer.name;
     }
 
     const inputTensor = tf.tidy(() => {
@@ -771,20 +815,25 @@
     const varName = "gradcam_conv_var_" + Date.now() + "_" + Math.random().toString(36).slice(2);
     const convVar = tf.variable(convOutput, true, varName);
 
+    // Everything after the chosen layer is applied in order. MobileNet has no skip
+    // connections, so the remainder of the network is a straight chain and can be
+    // replayed this way from any point in it.
     const { grads } = tf.variableGrads(() => {
-      const pooled = gapLayer.apply(convVar);
-      const logits = denseLayer.apply(pooled);
-      const flat = logits.reshape([2]);
+      let x = convVar;
+      for (let i=layerIdx+1; i<state.model.layers.length; i++){
+        x = state.model.layers[i].apply(x);
+      }
+      const flat = x.reshape([2]);
       return tf.unstack(flat)[classIndex];
     }, [convVar]);
 
     const gradTensor = grads[varName];
 
     const resized = tf.tidy(() => {
-      const pooledGrad = gradTensor.mean([0,1,2]);           // [1024]
-      const convSq = convVar.squeeze([0]);                   // [7,7,1024]
-      const weighted = convSq.mul(pooledGrad);               // [7,7,1024]
-      let cam = weighted.sum(-1);                            // [7,7]
+      const pooledGrad = gradTensor.mean([0,1,2]);           // per-channel weight
+      const convSq = convVar.squeeze([0]);                   // [H,W,C]
+      const weighted = convSq.mul(pooledGrad);
+      let cam = weighted.sum(-1);                            // [H,W]
       cam = cam.relu();
       const maxV = cam.max();
       cam = cam.div(maxV.add(1e-8));
@@ -844,17 +893,93 @@
     return { w, h, n, lum, green };
   }
 
+  // Centre and radius of the camera aperture, from the extent of the lit area.
+  function apertureGeometry(lum, w, h){
+    let hi = 0;
+    for (let i=0;i<w*h;i++) if (lum[i] > hi) hi = lum[i];
+    const thr = Math.max(14, hi*0.20);
+    let minX = w, maxX = -1, minY = h, maxY = -1;
+    for (let y=0; y<h; y++){
+      for (let x=0; x<w; x++){
+        if (lum[y*w+x] <= thr) continue;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (maxX < 0) return { cx: w/2, cy: h/2, R: Math.min(w,h)/2 };
+    return {
+      cx: (minX+maxX)/2, cy: (minY+maxY)/2,
+      R: Math.max(1, Math.max(maxX-minX, maxY-minY)/2)
+    };
+  }
+
+  // The usable retina, found by fitting the camera aperture rather than trimming a
+  // fixed margin off whatever is brighter than a fixed number.
+  //
+  // Both of those shortcuts failed on real images. A fixed brightness cutoff keeps
+  // the vignetted rim, which is genuine retina but far darker than the rest, so it
+  // reads as one enormous dark lesion — the crescent that appeared beside the disc.
+  // A fixed erosion cannot reach it either, because the vignette is much wider than
+  // the margin. Fitting the aperture and working inside a fraction of its radius
+  // handles both, and adapts to how much of the frame the retina fills. The
+  // fraction kept is deliberately generous: trimming a tenth of the radius was
+  // measured to discard genuine peripheral lesions, so large rim artifacts are
+  // dealt with by a size-keyed rule during classification instead.
   function retinaFieldMask(lum, w, h, erodeFrac){
     const n = w*h;
+    let hi = 0;
+    for (let i=0;i<n;i++) if (lum[i] > hi) hi = lum[i];
+
+    // Two different thresholds, for two different jobs.
+    //
+    // Fitting the aperture wants a firm cutoff, so the dim vignetted rim does not
+    // stretch the circle. Deciding which pixels are *inside* that aperture wants a
+    // far lower one, because a hemorrhage is dark: judged at the fitting cutoff it
+    // falls below the threshold and is carved out of the field as though it were
+    // outside the camera's view, so every dark lesion was punching a hole in its
+    // own analysis region and could never be found.
+    const fitThr = Math.max(14, hi*0.20);
+    const memberThr = Math.max(6, hi*0.06);
+
+    let minX = w, maxX = -1, minY = h, maxY = -1;
+    for (let y=0; y<h; y++){
+      for (let x=0; x<w; x++){
+        if (lum[y*w+x] <= fitThr) continue;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
     const m = new Uint8Array(n);
-    for (let i=0;i<n;i++) m[i] = lum[i] > 18 ? 1 : 0;
-    return erodeMask(m, w, h, Math.max(2, Math.round(Math.min(w,h)*erodeFrac)));
+    if (maxX < 0) return m;
+
+    const cx = (minX+maxX)/2, cy = (minY+maxY)/2;
+    const R = Math.max(maxX-minX, maxY-minY)/2;
+    // Generous: trimming a tenth of the radius was measured to discard genuine
+    // peripheral lesions. Large rim artifacts are handled during classification
+    // by a rule keyed on size as well as position.
+    const rIn = R*(1 - Math.max(0.02, erodeFrac*0.9));
+    const rIn2 = rIn*rIn;
+
+    for (let y=0; y<h; y++){
+      for (let x=0; x<w; x++){
+        const i = y*w+x;
+        const dx = x-cx, dy = y-cy;
+        if (dx*dx + dy*dy > rIn2) continue;
+        if (lum[i] <= memberThr) continue;   // true black surround only
+        m[i] = 1;
+      }
+    }
+    return erodeMask(m, w, h, 2);
   }
 
   // Background estimate that only averages retina. A plain box blur near the
   // field-of-view rim mixes in the black surround, which drags the local
   // background down and makes ordinary edge retina look brighter than its
-  // neighbourhood. That is what produced the ring of spurious bright findings
+  // neighbourhood. That is what produced a ring of spurious bright findings
   // around the border. Dividing by the blurred mask renormalises each window to
   // the pixels that actually carry image data.
   function maskedBlur(src, mask, w, h, radius){
@@ -1093,7 +1218,7 @@
     }
 
     blobs.sort((a,b) => b.peak - a.peak || b.area - a.area);
-    return blobs.slice(0, 5);
+    return blobs.slice(0, CAM_REGION_LIMIT);
   }
 
   // Turbo-like ramp. Ordered so lightness rises with the value, which keeps the
@@ -1209,13 +1334,30 @@
     const w = targetCanvas.width, h = targetCanvas.height;
     const fontPx = Math.max(11, Math.round(w*0.028));
     const findings = [];
+    let discCount = 0;
 
-    blobs.forEach((b, i) => {
-      const n = i+1;
+    // The optic disc draws strong attention from almost any fundus classifier:
+    // it is the brightest, most distinctive structure in the frame, and a network
+    // uses it to orient itself. That attention is real and worth showing, but it
+    // is not a finding, so disc regions are drawn dashed and labelled rather than
+    // numbered among the results.
+    function onDisc(b){
+      if (!anatomy) return false;
+      return Math.hypot(b.cx-anatomy.disc.x, b.cy-anatomy.disc.y) <= anatomy.disc.radius*1.2;
+    }
+
+    let n = 0;
+    blobs.forEach(b => {
       const r = Math.max(9, b.radius);
+      if (onDisc(b)){
+        discCount++;
+        strokeCircle(ctx, b.cx, b.cy, r, [4,3]);
+        haloText(ctx, "disc", b.cx, clamp(b.cy - r - 3, fontPx, h-2), "center", "bottom", false, fontPx);
+        return;
+      }
+      n++;
       strokeCircle(ctx, b.cx, b.cy, r);
-      const labelY = clamp(b.cy - r - 3, fontPx, h-2);
-      haloText(ctx, String(n), b.cx, labelY, "center", "bottom", true, fontPx);
+      haloText(ctx, String(n), b.cx, clamp(b.cy - r - 3, fontPx, h-2), "center", "bottom", true, fontPx);
       findings.push({
         index: n,
         quadrant: anatomy ? quadrantLabel(b.cx, b.cy, anatomy.disc, anatomy.nasalSide) : "n/a",
@@ -1223,7 +1365,7 @@
         areaPct: (b.area/(w*h))*100
       });
     });
-    return findings;
+    return { findings, discCount };
   }
 
   function drawAnatomyOverlay(sourceCanvas, anatomy, targetCanvas){
@@ -1282,10 +1424,13 @@
     haloText(ctx, "Fovea", clamp(fovea.x + s + 3, 0, w), fovea.y, "left", "middle", false, fontPx);
   }
 
-  function renderFindingsLegend(findings){
+  function renderFindingsLegend(findings, discCount){
     const container = document.getElementById("findings-legend");
+    const discNote = discCount
+      ? `<p class="small">${discCount} further region${discCount===1?" was":"s were"} centred on the optic disc and ${discCount===1?"is":"are"} drawn dashed rather than numbered. Attention there is expected — the disc is the most distinctive structure in the frame and the network uses it to orient itself — so it is shown but not counted as a finding.</p>`
+      : "";
     if (!findings || findings.length === 0){
-      container.innerHTML = `<p class="small">No region of the gradient exceeded the marking threshold — the model's attention is spread out rather than concentrated in discrete spots, so nothing is circled above.</p>`;
+      container.innerHTML = `<p class="small">No region of the gradient exceeded the marking threshold — the model's attention is spread out rather than concentrated in discrete spots, so nothing is circled above.</p>` + discNote;
       return;
     }
     let rows = findings.map(f => `
@@ -1293,7 +1438,7 @@
         <td>Region ${f.index}</td>
         <td>${f.quadrant} quadrant · peak activation ${(f.peak*100).toFixed(0)}% of maximum · ${f.areaPct.toFixed(1)}% of frame area</td>
       </tr>`).join("");
-    container.innerHTML = `<table class="kv">${rows}</table>`;
+    container.innerHTML = `<table class="kv">${rows}</table>` + discNote;
   }
 
   function renderAnatomyTable(anatomy){
@@ -1755,9 +1900,17 @@
       return Math.hypot(x-anatomy.disc.x, y-anatomy.disc.y) <= discR*mult;
     }
     const hasMacula = !!(anatomy && anatomy.fovea);
+    const ap = apertureGeometry(lum, w, h);
+    const edgeR2 = (ap.R*EDGE_ZONE_FRAC)*(ap.R*EDGE_ZONE_FRAC);
+    const edgeArtifactArea = Math.round(n*EDGE_ARTIFACT_AREA_FRAC);
+    function isEdgeArtifact(c){
+      if (c.area < edgeArtifactArea) return false;      // small peripheral lesions stay
+      const dx = c.cx-ap.cx, dy = c.cy-ap.cy;
+      return (dx*dx + dy*dy) > edgeR2;
+    }
 
     const candidates = [];
-    const rejected = { vessel:0, tooLarge:0, tooSmall:0, disc:0, weak:0, streak:0, noSeed:0, macula:0, smooth:0 };
+    const rejected = { vessel:0, tooLarge:0, tooSmall:0, disc:0, weak:0, streak:0, noSeed:0, macula:0, smooth:0, edge:0 };
 
     const darkCovered = new Uint8Array(n), brightCovered = new Uint8Array(n);
 
@@ -1771,6 +1924,7 @@
         if (c.area < minArea){ rejected.tooSmall++; return; }
         if (c.area > maxArea){ rejected.tooLarge++; return; }
         if (nearDisc(c.cx, c.cy, 1.15)){ rejected.disc++; return; }
+        if (isEdgeArtifact(c)){ rejected.edge++; return; }
         if (c.aspect > 4.0 && c.fillRatio < 0.30){ rejected.streak++; return; }
 
         const floor = dark ? DARK_CONTRAST_FLOOR : BRIGHT_CONTRAST_FLOOR;
@@ -1916,7 +2070,7 @@
       const noisy = total > NOISE_SUSPICION_COUNT;
       const capped = total > OVERLAY_CIRCLE_LIMIT;
       summary.innerHTML = `<p><strong>${total} candidate region${total===1?"":"s"}</strong> covering ${lesions.lesionPixels.toLocaleString()} px, ${pctOfRetina.toFixed(2)}% of the retinal area.
-        Rejected during filtering: ${lesions.rejected.vessel} as vessel or vessel fragment, ${lesions.rejected.weak} as too faint against the noise floor, ${lesions.rejected.tooLarge} as too large, ${lesions.rejected.tooSmall} as too small, ${lesions.rejected.streak} as bright streaks, ${lesions.rejected.disc} inside the optic disc, ${lesions.rejected.macula} as macular pigmentation, ${lesions.rejected.smooth} as broad smooth shading, ${lesions.rejected.noSeed} for having no core strong enough to seed a region.
+        Rejected during filtering: ${lesions.rejected.vessel} as vessel or vessel fragment, ${lesions.rejected.weak} as too faint against the noise floor, ${lesions.rejected.tooLarge} as too large, ${lesions.rejected.tooSmall} as too small, ${lesions.rejected.streak} as bright streaks, ${lesions.rejected.disc} inside the optic disc, ${lesions.rejected.edge} as large regions at the edge of the aperture, ${lesions.rejected.macula} as macular pigmentation, ${lesions.rejected.smooth} as broad smooth shading, ${lesions.rejected.noSeed} for having no core strong enough to seed a region.
         ${capped ? `The fundus overlay rings the ${OVERLAY_CIRCLE_LIMIT} largest; both mask canvases show all of them.` : ""}
         ${lesions.discExcluded ? "" : "<em>Optic disc position was unavailable, so the disc was not excluded and its bright pixels may appear as exudate candidates.</em>"}
         ${lesions.maculaExcluded ? "" : "<em>Macula position was unavailable, so normal macular darkening may appear here as a large dark candidate.</em>"}</p>`
@@ -2045,6 +2199,25 @@
   // ---------------------------------------------------------------------
   // RENDER: STEP 3
   // ---------------------------------------------------------------------
+  // Draws both Grad-CAM panels and their region markers. Shared so the controls
+  // can redraw without recomputing the gradient.
+  function redrawCamRegions(sourceCanvas, cam, anatomy, desc){
+    const gcCanvas = document.getElementById("canvas-gradcam");
+    const gcColour = document.getElementById("canvas-gradcam-colour");
+    renderGradCAMOverlay(sourceCanvas, cam.camArray, cam.h, cam.w, gcCanvas);
+    renderGradCAMColour(sourceCanvas, cam.camArray, gcColour);
+    const blobs = findDefectBlobs(cam.camArray, cam.h, cam.w, BLOB_THRESHOLD, BLOB_MIN_AREA_FRAC);
+    const marked = drawDefectMarkers(gcCanvas, blobs, anatomy);
+    drawDefectMarkers(gcColour, blobs, anatomy);
+    state.lastFindings = marked.findings;
+    renderFindingsLegend(marked.findings, marked.discCount);
+    const t = document.getElementById("blob-threshold-text");
+    if (t) t.textContent = Math.round(BLOB_THRESHOLD*100) + "%";
+    const ln = document.getElementById("cam-layer-name");
+    if (ln && state.camLayerName) ln.textContent = state.camLayerName;
+    return marked;
+  }
+
   function renderGradCAMStep(desc, findings, anatomy){
     const note = $("#gradcam-note");
     const focalText = desc.focal
@@ -2177,6 +2350,7 @@
     });
     state.lastGrading = null;
     state.lastGradcamDesc = null;
+    state.lastCam = null;
     state.lastAnatomy = null;
     state.lastFindings = null;
     state.lastLesions = null;
@@ -2267,17 +2441,9 @@
         // 3a: gradient overlay, then circle the connected high-activation regions
         const desc = describeGradCAM(cam.camArray, cam.h, cam.w, anatomy);
         state.lastGradcamDesc = desc;
-        const gcCanvas = document.getElementById("canvas-gradcam");
-        const gcColour = document.getElementById("canvas-gradcam-colour");
-        renderGradCAMOverlay(procCanvas, cam.camArray, cam.h, cam.w, gcCanvas);
-        renderGradCAMColour(procCanvas, cam.camArray, gcColour);
-        const blobs = findDefectBlobs(cam.camArray, cam.h, cam.w, BLOB_THRESHOLD, BLOB_MIN_AREA_FRAC);
-        const findings = drawDefectMarkers(gcCanvas, blobs, anatomy);
-        drawDefectMarkers(gcColour, blobs, anatomy);
-        state.lastFindings = findings;
-        renderFindingsLegend(findings);
-
-        renderGradCAMStep(desc, findings, anatomy);
+        state.lastCam = cam;
+        const marked = redrawCamRegions(procCanvas, cam, anatomy, desc);
+        renderGradCAMStep(desc, marked.findings, anatomy);
       } catch(gcErr){
         console.error("Grad-CAM failed", gcErr);
         $("#gradcam-note").innerHTML = `Grad-CAM computation failed in this session (${gcErr.message||gcErr}). No heatmap is shown — this is disclosed rather than faked.`;
@@ -2334,6 +2500,18 @@
       const files = $("#file-input").files;
       if (files.length === 0) return;
       runPipeline(files[0]);
+    });
+
+    $("#rerun-cam").addEventListener("click", () => {
+      if (!state.lastCam || !state.procCanvas){
+        $("#gradcam-note").textContent = "Run the pipeline on an image first.";
+        return;
+      }
+      BLOB_THRESHOLD = clamp(parseFloat($("#tune-cam-threshold").value) || BLOB_THRESHOLD, 0.15, 0.95);
+      CAM_REGION_LIMIT = Math.max(1, Math.round(parseFloat($("#tune-cam-limit").value) || CAM_REGION_LIMIT));
+      const marked = redrawCamRegions(state.procCanvas, state.lastCam, state.lastAnatomy, state.lastGradcamDesc);
+      if (state.lastGradcamDesc) renderGradCAMStep(state.lastGradcamDesc, marked.findings, state.lastAnatomy);
+      if (state.lastQuality) renderReport();
     });
 
     $("#rerun-detection").addEventListener("click", async () => {
