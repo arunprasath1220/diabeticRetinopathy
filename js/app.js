@@ -128,6 +128,7 @@
     lastAnatomy: null,
     lastFindings: null,
     lastLesions: null,
+    lastSeverity: null,
     lastThroughput: null
   };
 
@@ -1152,6 +1153,11 @@
   };
   const LESION_ORDER = ["MA","HEM","HE","CWS"];
 
+  // The "4" arm of the ICDR 4-2-1 rule for severe NPDR: more than twenty
+  // intraretinal hemorrhages in each of the four quadrants.
+  const ICDR_HEM_PER_QUADRANT = 20;
+  const QUADRANT_NAMES = ["Superior-Nasal","Superior-Temporal","Inferior-Nasal","Inferior-Temporal"];
+
   function erodeMask(mask, w, h, radius){
     const f = new Float32Array(mask.length);
     for (let i=0;i<mask.length;i++) f[i] = mask[i];
@@ -1654,6 +1660,194 @@
     };
   }
 
+
+  // ---------------------------------------------------------------------
+  // ICDR SEVERITY ESTIMATE
+  //
+  // The published scale is defined by which lesion types are present and, for
+  // severe disease, by how many hemorrhages appear in each quadrant:
+  //
+  //   0  No apparent retinopathy   no abnormality
+  //   1  Mild NPDR                 microaneurysms only
+  //   2  Moderate NPDR             more than microaneurysms, less than severe
+  //   3  Severe NPDR               no PDR signs, and any of the 4-2-1 rule:
+  //                                  >20 intraretinal hemorrhages in each of 4 quadrants,
+  //                                  venous beading in 2 or more quadrants,
+  //                                  prominent IRMA in 1 or more quadrant
+  //   4  Proliferative DR          neovascularisation, or vitreous/preretinal hemorrhage
+  //
+  // Applying it here is legitimate because the rule is itself a function of lesion
+  // type and count, which is exactly what Step 4 produces. What it is NOT is a
+  // diagnosis: the counts are unvalidated candidates, so the grade inherits every
+  // one of their errors.
+  //
+  // There is also a hard ceiling. Two of the three arms of the 4-2-1 rule are
+  // venous beading and IRMA, and level 4 is defined by neovascularisation. This
+  // detector cannot see any of the three, because all are elongated structures that
+  // its vessel test removes by construction. So it can reach level 3 only through
+  // the hemorrhage arm, can never reach level 4, and above all can never rule
+  // either of them out. That limitation is stated with every result rather than
+  // buried, because a low grade here does not mean a low grade in the eye.
+  // ---------------------------------------------------------------------
+  function quadrantLesionCounts(lesions, anatomy){
+    if (!anatomy || !lesions) return null;
+    const grid = {};
+    LESION_ORDER.forEach(k => { grid[k] = {}; QUADRANT_NAMES.forEach(q => grid[k][q] = 0); });
+    lesions.candidates.forEach(c => {
+      const q = quadrantLabel(c.cx, c.cy, anatomy.disc, anatomy.nasalSide);
+      if (grid[c.type.key] && grid[c.type.key][q] !== undefined) grid[c.type.key][q]++;
+    });
+    return grid;
+  }
+
+  function assessSeverity(lesions, anatomy, grading, quality){
+    const counts = lesions ? lesions.counts : null;
+    const ma  = counts ? counts.MA  : 0;
+    const hem = counts ? counts.HEM : 0;
+    const he  = counts ? counts.HE  : 0;
+    const cws = counts ? counts.CWS : 0;
+    const beyondMA = hem + he + cws;
+    const total = ma + beyondMA;
+
+    const grid = quadrantLesionCounts(lesions, anatomy);
+    let quadsOverThreshold = 0;
+    if (grid) QUADRANT_NAMES.forEach(q => {
+      if (grid.HEM[q] > ICDR_HEM_PER_QUADRANT) quadsOverThreshold++;
+    });
+    const hemArmMet = !!grid && quadsOverThreshold === 4;
+
+    let level, label, basis = [];
+    if (!lesions){
+      level = null; label = "Not assessed";
+      basis.push("lesion detection did not run on this image");
+    } else if (hemArmMet){
+      level = 3; label = "Severe NPDR pattern";
+      basis.push("more than " + ICDR_HEM_PER_QUADRANT + " hemorrhage candidates in each of the four quadrants, which is the hemorrhage arm of the 4-2-1 rule");
+    } else if (beyondMA > 0){
+      level = 2; label = "Moderate NPDR pattern";
+      basis.push("more than microaneurysms alone: " + hem + " hemorrhage, " + he + " hard exudate and " + cws + " cotton wool candidates");
+    } else if (ma > 0){
+      level = 1; label = "Mild NPDR pattern";
+      basis.push(ma + " microaneurysm candidate" + (ma===1?"":"s") + " and nothing else");
+    } else {
+      level = 0; label = "No retinopathy observed";
+      basis.push("no lesion candidate passed the detector on this image");
+    }
+
+    // Everything that makes this estimate untrustworthy on this particular image.
+    const doubts = [];
+    if (!lesions) doubts.push("lesion detection did not complete");
+    if (!anatomy) doubts.push("landmarks could not be estimated, so the quadrant rule for severe disease could not be applied at all");
+    if (quality && quality.verdict && quality.verdict.verdict === "enhance")
+      doubts.push("image quality was borderline and had to be enhanced before analysis");
+    if (lesions && total > NOISE_SUSPICION_COUNT)
+      doubts.push("the candidate count is high enough to suggest the detector is responding to image noise");
+    if (grid && quadsOverThreshold > 0 && quadsOverThreshold < 4)
+      doubts.push("hemorrhage candidates exceed the severe-disease threshold in " + quadsOverThreshold + " of four quadrants, which sits right on the boundary of the rule");
+
+    // The cross-check that the two independent stages exist to provide.
+    if (grading){
+      const modelSaysDR = grading.predClass === 1;
+      if (modelSaysDR && level === 0)
+        doubts.push("the classifier reports disease present while the detector found no lesion at all, and the two disagree");
+      if (!modelSaysDR && level >= 2)
+        doubts.push("the classifier reports no disease while the detector found lesions beyond microaneurysms, and the two disagree");
+    } else {
+      doubts.push("the classifier did not run, so there is no independent check on this result");
+    }
+
+    // Refer whenever the rule says referable, whenever anything is in doubt, and
+    // whenever any lesion at all was seen. Only a clean, agreeing, lesion-free
+    // image avoids it.
+    const referable = level !== null && level >= 2;
+    const uncertain = doubts.length > 0;
+    const refer = referable || uncertain || (level !== null && level >= 1);
+
+    let reason;
+    if (referable) reason = "This image reaches the referable threshold (moderate NPDR or worse) under the ICDR rule.";
+    else if (uncertain) reason = "This result is not reliable enough to stand on its own.";
+    else if (level >= 1) reason = "Lesions were seen. Any retinopathy needs a specialist opinion.";
+    else reason = "Severe disease and proliferative disease cannot be excluded by this method.";
+
+    return {
+      level, label, basis, doubts, refer, referable, uncertain, reason,
+      grid, quadsOverThreshold, counts, total
+    };
+  }
+
+  function renderSeverity(sev){
+    const box = document.getElementById("grade-result");
+    const scale = [
+      [0,"0","No DR"],[1,"1","Mild"],[2,"2","Moderate"],[3,"3","Severe"],[4,"4","Proliferative"]
+    ].map(([n,num,txt]) =>
+      '<div class="' + (sev.level === n ? "on" : "") + '">' + num + '<br>' + txt + '</div>'
+    ).join("");
+
+    let html = '<div class="grade-box">';
+    html += '<p class="grade-level">' + (sev.level === null ? "Not assessed" : "Level " + sev.level) + '</p>';
+    html += '<p class="grade-label">' + sev.label + (sev.referable ? " &middot; referable" : "") + '</p>';
+    html += '<div class="grade-scale">' + scale + '</div>';
+    html += '<ul class="grade-basis">' + sev.basis.map(b => "<li>" + b + "</li>").join("") + '</ul>';
+
+    html += '<div class="ceiling"><strong>What this grade cannot say.</strong> Two of the three arms of the ' +
+      'severe-disease rule are venous beading and IRMA, and proliferative disease is defined by ' +
+      'neovascularisation. This detector cannot see any of the three, because all are elongated and its ' +
+      'vessel test removes them by construction. It can therefore reach level 3 only through the hemorrhage ' +
+      'count, can never reach level 4, and <strong>can never rule either of them out</strong>. A low grade ' +
+      'here does not mean a low grade in the eye.</div>';
+
+    if (sev.doubts.length){
+      html += '<div class="ceiling"><strong>Why this particular result is doubtful.</strong><ul>' +
+        sev.doubts.map(d => "<li>" + d + "</li>").join("") + '</ul></div>';
+    }
+    html += '</div>';
+    box.innerHTML = html;
+
+    // quadrant table for the hemorrhage arm
+    const qwrap = document.getElementById("grade-quadrants");
+    if (!sev.grid){
+      qwrap.innerHTML = '<p class="small">Quadrant counts are unavailable because landmark estimation did not produce an optic disc position, so the 4-2-1 rule could not be evaluated.</p>';
+    } else {
+      const rows = QUADRANT_NAMES.map(q =>
+        "<tr><td>" + q + "</td><td>" + sev.grid.HEM[q] + "</td><td>" +
+        (sev.grid.HEM[q] > ICDR_HEM_PER_QUADRANT ? "over threshold" : "under") + "</td></tr>"
+      ).join("");
+      qwrap.innerHTML =
+        '<h3>Hemorrhage candidates per quadrant</h3>' +
+        '<table class="icdr-table"><thead><tr><th>Quadrant</th><th>Candidates</th><th>Against the ' +
+        ICDR_HEM_PER_QUADRANT + '-per-quadrant threshold</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+        '<p class="small">Severe NPDR needs all four quadrants over the threshold; ' + sev.quadsOverThreshold +
+        ' of four are here. Quadrants are measured from the estimated optic disc rather than a clinical ' +
+        'landmark set, so a mislocated disc moves every count between quadrants.</p>';
+    }
+  }
+
+  // Raises the referral banner without a grade behind it, for the cases where the
+  // app could not assess the image at all. Those are the moments the user is told
+  // least, so they are exactly the moments the warning matters most.
+  function referWithoutGrade(reason, points){
+    const el = document.getElementById("refer-banner");
+    const txt = document.getElementById("refer-reason");
+    if (!el || !txt) return;
+    let html = reason;
+    if (points && points.length) html += "<ul>" + points.map(p => "<li>" + p + "</li>").join("") + "</ul>";
+    txt.innerHTML = html;
+    el.classList.add("visible");
+  }
+
+  function renderReferBanner(sev){
+    const el = document.getElementById("refer-banner");
+    const txt = document.getElementById("refer-reason");
+    if (!el || !txt) return;
+    if (!sev || !sev.refer){ el.classList.remove("visible"); return; }
+    let html = sev.reason;
+    if (sev.doubts.length){
+      html += "<ul>" + sev.doubts.slice(0,3).map(d => "<li>" + d + "</li>").join("") + "</ul>";
+    }
+    txt.innerHTML = html;
+    el.classList.add("visible");
+  }
+
   // ---------------------------------------------------------------------
   // STEP 4 RENDERING
   // ---------------------------------------------------------------------
@@ -1983,6 +2177,19 @@
         html += `<p class="small">Quadrants are named relative to the estimated optic disc at x ${Math.round(a.disc.x)}, y ${Math.round(a.disc.y)} px, with the nasal side to the ${a.nasalSide} of that axis. Landmark positions are heuristic estimates for orientation, not a trained detection.</p>`;
       }
     }
+    const sev = state.lastSeverity;
+    if (sev){
+      html += `<h3>ICDR severity estimate</h3><table class="kv">
+        <tr><td>Grade</td><td>${sev.level === null ? "not assessed" : "Level " + sev.level + " — " + sev.label}</td></tr>
+        <tr><td>Referable</td><td>${sev.referable ? "yes, moderate NPDR or worse under the rule" : "not by this estimate"}</td></tr>
+        <tr><td>Specialist review</td><td>${sev.refer ? "indicated — " + sev.reason : "not flagged by this estimate"}</td></tr>
+      </table>`;
+      html += `<p class="small">Applied to unvalidated candidates, so the grade inherits their errors. Venous beading, IRMA and neovascularisation are not detectable by this method, so severe and proliferative disease can never be excluded here.</p>`;
+      if (sev.doubts.length){
+        html += `<p class="small"><strong>Doubts on this image:</strong> ${sev.doubts.join("; ")}.</p>`;
+      }
+    }
+
     const les = state.lastLesions;
     if (les && les.candidates.length){
       html += `<h3>Lesion candidates (classical morphology, not the CNN)</h3><table class="kv">` +
@@ -2026,6 +2233,13 @@
     state.lastAnatomy = null;
     state.lastFindings = null;
     state.lastLesions = null;
+    state.lastSeverity = null;
+    const rb = document.getElementById("refer-banner");
+    if (rb) rb.classList.remove("visible");
+    ["grade-result","grade-quadrants"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = "";
+    });
   }
 
   async function runPipeline(file){
@@ -2048,6 +2262,12 @@
       if (verdict.verdict === "reject"){
         enhancedCanvas.getContext("2d").clearRect(0,0,enhancedCanvas.width,enhancedCanvas.height);
         enhancedCanvas.width = 1; enhancedCanvas.height = 1;
+        // Nothing was assessed, so nothing can be reassuring. Screening an image
+        // this poor would produce a confident-looking result with no basis.
+        referWithoutGrade(
+          "This image could not be assessed at all, so nothing here rules anything out.",
+          ["the image failed the quality check: " + (verdict.reason || "quality too low to analyse"),
+           "recapture if you can, and refer if a usable image cannot be obtained"]);
         $("#run-button").disabled = false;
         return; // do not proceed to inference
       }
@@ -2061,32 +2281,27 @@
       enhancedCanvas.height = procCanvas.height;
       enhancedCanvas.getContext("2d").drawImage(procCanvas, 0, 0);
 
-      if (!state.modelReady){
-        showStep("step2");
-        $("#model-scope-notice").innerHTML = `<strong>Classifier unavailable — demo mode.</strong> The TensorFlow.js model failed to load in this session, so no classification or Grad-CAM is shown. This is disclosed rather than substituted with placeholder numbers.`;
-        $("#grading-results").innerHTML = "";
-        // Step 3 (Grad-CAM) has no real classification to explain, so it is skipped entirely.
-        // Steps 4-5 and the report don't depend on this image's classification, so they still proceed.
-        showStep("step4");
-        showStep("step5");
-        renderThroughputStep();
-        showStep("report");
-        renderReport();
-        $("#run-button").disabled = false;
-        return;
-      }
+      // The classifier and Grad-CAM need the model. Landmarks, lesion detection,
+      // the grading rule and the throughput sim do not, so a failed model download
+      // costs those stages nothing and they still run.
+      const modelRan = state.modelReady;
 
-      // STEP 2: grading
-      const gradingResult = await runInference(procCanvas);
-      state.lastGrading = gradingResult;
       showStep("step2");
-      renderGradingStep(gradingResult);
+      if (!modelRan){
+        $("#model-scope-notice").innerHTML = `<strong>Classifier unavailable — demo mode.</strong> The TensorFlow.js model failed to load in this session, so no classification and no Grad-CAM are shown. This is disclosed rather than substituted with placeholder numbers. The lesion detector below is classical image processing and does not need the model, so it still runs — but nothing cross-checks it.`;
+        $("#grading-results").innerHTML = "";
+      } else {
+        // STEP 2: grading
+        const gradingResult = await runInference(procCanvas);
+        state.lastGrading = gradingResult;
+        renderGradingStep(gradingResult);
 
-      if (state.measuredThroughputPerMin === null){
-        state.measuredThroughputPerMin = 60000/gradingResult.elapsedMs;
-        const modelRateInput = $("#in-modelrate");
-        modelRateInput.value = state.measuredThroughputPerMin.toFixed(2);
-        $("#modelrate-note").textContent = `Measured live from this session: one image took ${gradingResult.elapsedMs.toFixed(0)} ms, i.e. ${state.measuredThroughputPerMin.toFixed(2)} images/min on this device. Editable above.`;
+        if (state.measuredThroughputPerMin === null){
+          state.measuredThroughputPerMin = 60000/gradingResult.elapsedMs;
+          const modelRateInput = $("#in-modelrate");
+          modelRateInput.value = state.measuredThroughputPerMin.toFixed(2);
+          $("#modelrate-note").textContent = `Measured live from this session: one image took ${gradingResult.elapsedMs.toFixed(0)} ms, i.e. ${state.measuredThroughputPerMin.toFixed(2)} images/min on this device. Editable above.`;
+        }
       }
 
       // 3b: anatomical landmarks. Computed before Grad-CAM because both step 3
@@ -2108,6 +2323,7 @@
 
       // STEP 3: Grad-CAM (class index 1 = "DR present", regardless of predicted class)
       try{
+        if (!modelRan) throw new Error("classifier unavailable, so there are no gradients to read");
         const cam = await computeGradCAM(procCanvas, 1);
 
         // 3a: gradient overlay, then circle the connected high-activation regions
@@ -2133,10 +2349,22 @@
         renderTypedMask(lesions, document.getElementById("canvas-mask-typed"));
         renderLesionOverlay(procCanvas, lesions, document.getElementById("canvas-lesion-overlay"));
         renderLesionTables(lesions, anatomy);
+
+        // Step 5: apply the published grading rule to what was found.
+        const sev = assessSeverity(lesions, anatomy, state.lastGrading, state.lastQuality);
+        state.lastSeverity = sev;
+        showStep("severity");
+        renderSeverity(sev);
+        renderReferBanner(sev);
       } catch(lesErr){
         console.error("Lesion candidate detection failed", lesErr);
         document.getElementById("lesion-summary").innerHTML =
           `<p class="notice">Lesion candidate detection failed on this image (${lesErr.message||lesErr}). No mask is shown rather than an empty one being passed off as a clear retina.</p>`;
+        const sev = assessSeverity(null, anatomy, state.lastGrading, state.lastQuality);
+        state.lastSeverity = sev;
+        showStep("severity");
+        renderSeverity(sev);
+        renderReferBanner(sev);
       }
 
       // STEP 5: throughput (auto-render once with current/measured inputs)
@@ -2207,6 +2435,11 @@
         renderTypedMask(lesions, document.getElementById("canvas-mask-typed"));
         renderLesionOverlay(state.procCanvas, lesions, document.getElementById("canvas-lesion-overlay"));
         renderLesionTables(lesions, state.lastAnatomy);
+        const sev = assessSeverity(lesions, state.lastAnatomy, state.lastGrading, state.lastQuality);
+        state.lastSeverity = sev;
+        showStep("severity");
+        renderSeverity(sev);
+        renderReferBanner(sev);
         if (state.lastQuality) renderReport();
       } catch(err){
         console.error(err);

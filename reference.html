@@ -87,7 +87,22 @@
     <p>Every region it reports is a <strong>candidate</strong>. Nothing here has been validated against
     ground-truth lesion masks, so no accuracy figure is claimed for it.</p>
 
-    <h3>5. Throughput planning</h3>
+    <h3>5. ICDR severity estimate</h3>
+    <p>The ICDR scale is defined by which lesion types are present and, for severe disease, by how many
+    hemorrhages appear in each quadrant. That is what stage 4 produces, so the published rule is applied
+    to those counts directly. The rule is followed faithfully; the counts it is fed are not validated,
+    so the grade is what the rule yields <strong>if</strong> those candidates were confirmed findings.</p>
+    <p><strong>The ceiling matters more than the grade.</strong> Two of the three arms of the 4-2-1 rule
+    are venous beading and IRMA, and proliferative disease is defined by neovascularisation. None of the
+    three is detectable here, because all are elongated and the vessel test removes them by construction.
+    So the estimate can reach severe NPDR only by counting hemorrhages, can never reach proliferative DR,
+    and can never rule either of them out. A low grade here does not mean a low grade in the eye.</p>
+    <p>A red referral banner appears whenever the result should not stand on its own: at or above the
+    referable threshold, when any lesion is seen at all, when landmarks fail, when image quality was
+    borderline, when the candidate count suggests noise, when hemorrhage counts sit on the rule's
+    boundary, or when the classifier and the lesion detector disagree with each other.</p>
+
+    <h3>6. Throughput planning</h3>
     <p>A deliberately simple capacity model, not part of the AI at all. It takes acquisition rate,
     bandwidth, measured model speed and reviewer capacity, and reports which stage is the bottleneck.
     A production version of this would be a Simulink model.</p>

@@ -33,9 +33,16 @@ Open `index.html` in a browser. That is the whole installation.
 - **`screening.html`** — the working application. Upload a fundus image and run the pipeline.
 - **`reference.html`** — ICDR severity scale, lesion vocabulary, and a summary of the method.
 
-The classifier weights (about 13 MB) download from a public CDN the first time
-`screening.html` loads, so that page needs an internet connection once. If the download fails the
-app says so plainly and refuses to show a grade, rather than substituting placeholder numbers.
+Whatever happens, the app ends in one of two states: a grade with its basis and its limits, or a red
+banner saying it could not assess the image. It never falls silent. An image rejected on quality, a
+failed model download and a crashed detector all raise the banner rather than leaving a blank page
+that could be mistaken for a clear result.
+
+The classifier weights (about 13 MB) download from a public CDN the first time `screening.html`
+loads, so that page needs an internet connection once. If the download fails the app says so plainly
+and shows no classification, rather than substituting placeholder numbers. The lesion detector, the
+landmark estimation, the grading rule and the throughput model are all classical code that needs no
+network and no model, so those still run — but with nothing cross-checking them, which the app flags.
 
 Opening the files directly from disk works. There is no build step and no package manager.
 
@@ -79,7 +86,7 @@ detection, rendering, throughput simulation, report, and finally the event wirin
 
 ## How it works, stage by stage
 
-An image passes through five stages. **The two stages that point at disease do so by completely
+An image passes through six stages. **The two stages that point at disease do so by completely
 unrelated means, and are never merged into a single score.** When they disagree, that disagreement
 is information; averaging it away would hide it.
 
@@ -166,7 +173,50 @@ is identifiable without reading a label.
 **Every region is a candidate, not a finding.** Nothing here has been validated against ground-truth
 lesion masks, so no accuracy figure is claimed.
 
-### Stage 5 — Throughput planning
+### Stage 5 — ICDR severity estimate
+
+The ICDR scale is itself defined by which lesion types are present and, for severe disease, by how
+many hemorrhages appear per quadrant. That is exactly what Stage 4 produces, so the published rule
+is applied to those counts directly:
+
+| Level | Criterion | Can this app reach it? |
+| --- | --- | --- |
+| 0 | No abnormality | Yes |
+| 1 | Microaneurysms only | Yes |
+| 2 | More than microaneurysms, less than severe | Yes — **referable threshold** |
+| 3 | No PDR signs, plus any 4-2-1 arm: more than 20 intraretinal hemorrhages in **each** of four quadrants, venous beading in two or more quadrants, or prominent IRMA in one or more | **Only via the hemorrhage arm** |
+| 4 | Neovascularisation, or vitreous / preretinal hemorrhage | **Never** |
+
+**The ceiling is the important part.** Two of the three arms of the 4-2-1 rule are venous beading and
+IRMA, and level 4 is defined by neovascularisation. This detector cannot see any of the three,
+because all are elongated structures that its vessel test removes by construction. So it can reach
+level 3 only by counting hemorrhages, can never reach level 4, and **can never rule either of them
+out**. A low grade here does not mean a low grade in the eye, and the app says so with every result.
+
+The grade is applied to unvalidated candidates, so it inherits all of their errors. It is what the
+grading rule yields *if* those candidates were confirmed findings: a projection, not a diagnosis.
+
+#### The referral banner
+
+A red banner appears at the bottom right whenever the result should not be trusted on its own. It
+triggers on:
+
+- any grade at or above level 2, the referable threshold;
+- any lesion at all, since any retinopathy warrants a specialist opinion;
+- landmark estimation failing, which makes the quadrant rule inapplicable;
+- borderline image quality that needed enhancement;
+- a candidate count high enough to suggest the detector is responding to noise;
+- hemorrhage counts over threshold in one to three quadrants, sitting on the rule's boundary;
+- **the two independent stages disagreeing** — the classifier reporting disease where the detector
+  found nothing, or the reverse.
+
+That last trigger is the reason stages 2 and 4 are kept apart and never averaged into one score.
+Their disagreement is a signal, and merging them would destroy it.
+
+Only a clean, lesion-free image where both stages agree avoids the banner, and even then the standing
+caveat about undetectable proliferative signs applies.
+
+### Stage 6 — Throughput planning
 
 Explicitly not part of the AI. A capacity model that takes image acquisition rate, available
 bandwidth, average file size, model throughput and ophthalmologist review capacity, and reports the
@@ -309,7 +359,7 @@ downstream quadrant name inherits the error.
 | Confidence figures | Raw softmax. **Not calibrated probabilities.** |
 | Grad-CAM | Real gradients. Coarse; a boundary means "around here". |
 | Lesion candidates | Classical morphology, independent of the classifier. **Candidates, not findings.** |
-| Severity grade | **Not produced.** No validated five-class model was loadable. |
+| Severity grade | The published ICDR rule applied to **unvalidated candidates**. A projection of the rule, not a diagnosis, and it cannot exclude severe or proliferative disease. |
 | Sensitivity / specificity | **Not claimed.** No peer-reviewed validation exists for this model. |
 | Segmentation | **Not learned segmentation.** The morphological detector is not a substitute. |
 | Throughput simulation | Arithmetic on your inputs, with model speed measured live. |
@@ -351,6 +401,7 @@ from `js/app.js`. No browser is needed.
 
 | Suite | Coverage |
 | --- | --- |
+| Severity | 27 checks: each ICDR level from its defining criterion, the 4-2-1 boundary at exactly 20 and at three of four quadrants, level 4 never being assigned, and every banner trigger including stage disagreement |
 | Seed level | 20 checks: lesions from microaneurysm to blot size, a lesion on a vessel, an exudate cluster, vessels at five angles, macula samples, plain retina |
 | End to end | 34 checks: the full detector, including a hemorrhage on each of four differently angled vessels, a vignetted rim sampled all the way round, a crescent shadow, a large edge artifact, and a small peripheral lesion that must survive |
 
@@ -404,7 +455,10 @@ measurement.
   disease are exactly the ones it misses.
 - **Venous beading and intraretinal microvascular abnormalities are not detected at all.** Both
   require judging vessel calibre along its length.
-- **No severity grading.** The classifier has two classes.
+- **The severity grade cannot exclude severe or proliferative disease.** Venous beading, IRMA and
+  neovascularisation are structurally undetectable here, so level 3 is reachable only by hemorrhage
+  count and level 4 not at all.
+- **The classifier itself has two classes**, and contributes to the grade only as a cross-check.
 - **Grad-CAM is coarse.** Even at 14×14 the cells are large relative to a microaneurysm.
 - **Detection takes several seconds** and runs on the main thread. A status line paints before the
   slow stage, but the page is unresponsive while it works. A Web Worker would fix this.

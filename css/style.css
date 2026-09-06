@@ -123,3 +123,31 @@
   table.matrix th{background:var(--grey1);font-weight:700;}
   table.matrix td:first-child{width:30%;}
   @media print{ .site-nav,.cta{display:none !important;} }
+
+  /* ---- severity estimate ---- */
+  .grade-box{border:2px solid var(--ink);padding:1rem 1.1rem;margin:.75rem 0;}
+  .grade-level{font-size:1.5rem;font-weight:700;line-height:1.1;margin:0 0 .2rem;}
+  .grade-label{font-size:1rem;margin:0 0 .6rem;}
+  .grade-scale{display:flex;gap:2px;margin:.7rem 0 .3rem;}
+  .grade-scale div{flex:1;border:1px solid var(--ink);padding:.3rem .2rem;text-align:center;
+    font-size:.7rem;color:var(--grey4);background:var(--paper);}
+  .grade-scale div.on{background:var(--ink);color:var(--paper);font-weight:700;}
+  .grade-basis{font-size:.85rem;margin:.5rem 0 0;}
+  .grade-basis li{margin:.2rem 0;}
+  .ceiling{border-left:3px solid var(--ink);padding:.5rem .8rem;margin:.9rem 0 0;
+    font-size:.83rem;background:var(--grey1);}
+
+  /* ---- referral banner. The one saturated colour in the project. It is a safety
+     signal rather than decoration, and it is the only element allowed to shout. ---- */
+  .refer-banner{position:fixed;right:1rem;bottom:1rem;z-index:60;max-width:23rem;
+    background:#c00000;color:#fff;border:2px solid #7a0000;padding:.85rem 1rem;
+    font-size:.85rem;line-height:1.45;display:none;box-shadow:0 0 0 1px #fff;}
+  .refer-banner.visible{display:block;}
+  .refer-banner strong{display:block;font-size:1.02rem;margin-bottom:.3rem;
+    letter-spacing:.01em;text-transform:uppercase;}
+  .refer-banner ul{margin:.4rem 0 0;padding-left:1.1rem;}
+  .refer-banner li{margin:.15rem 0;}
+  @media print{
+    .refer-banner{position:static;display:block !important;max-width:100%;
+      background:#fff;color:#000;border:2px solid #000;box-shadow:none;margin:1rem 0;}
+  }

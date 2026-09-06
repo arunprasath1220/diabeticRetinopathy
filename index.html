@@ -43,11 +43,12 @@
 
   <section>
     <h2>The pipeline</h2>
-    <p>An image passes through five stages. The two that point at disease do so by unrelated means,
-    and are deliberately never merged into a single score.</p>
+    <p>An image passes through six stages. The two that point at disease do so by unrelated means, and
+    are deliberately never merged into a single score. A grading step then applies the published ICDR
+    rule to what was found, and raises a referral warning whenever the result should not stand alone.</p>
 
     <svg class="diagram" viewBox="0 0 760 270" role="img"
-         aria-label="Five-stage pipeline: quality assessment, then classification, Grad-CAM explainability and lesion detection in parallel, feeding a report, with throughput planning alongside.">
+         aria-label="Six-stage pipeline: quality assessment, then classification, Grad-CAM explainability and lesion detection in parallel, then an ICDR grade and report, with throughput planning alongside.">
       <rect class="box" x="8" y="52" width="118" height="60"/>
       <text class="lbl-b" x="67" y="74" text-anchor="middle">1. Quality</text>
       <text class="lbl-sm" x="67" y="89" text-anchor="middle">focus, exposure,</text>
@@ -87,13 +88,19 @@
       <path class="arrow" d="M310 195 L358 195"/><path class="arrow" d="M351 191 L358 195 L351 199"/>
 
       <rect class="box" x="358" y="10" width="146" height="218"/>
-      <text class="lbl-b" x="431" y="104" text-anchor="middle">Report</text>
-      <text class="lbl-sm" x="431" y="123" text-anchor="middle">each result kept</text>
-      <text class="lbl-sm" x="431" y="135" text-anchor="middle">separate, labelled</text>
-      <text class="lbl-sm" x="431" y="147" text-anchor="middle">with its own basis</text>
+      <text class="lbl-b" x="431" y="72" text-anchor="middle">5. ICDR grade</text>
+      <text class="lbl-sm" x="431" y="89" text-anchor="middle">the published rule,</text>
+      <text class="lbl-sm" x="431" y="101" text-anchor="middle">applied to candidates</text>
+      <text class="lbl-sm" x="431" y="113" text-anchor="middle">cannot exclude</text>
+      <text class="lbl-sm" x="431" y="125" text-anchor="middle">proliferative disease</text>
+      <line x1="372" y1="140" x2="490" y2="140" stroke="#000" stroke-width="1"/>
+      <text class="lbl-b" x="431" y="160" text-anchor="middle">Report</text>
+      <text class="lbl-sm" x="431" y="176" text-anchor="middle">each result labelled</text>
+      <text class="lbl-sm" x="431" y="188" text-anchor="middle">with its own basis</text>
+      <text class="lbl-sm" x="431" y="206" text-anchor="middle">refer if in doubt</text>
 
       <rect class="box-muted" x="556" y="80" width="192" height="80"/>
-      <text class="lbl-b" x="652" y="103" text-anchor="middle">5. Throughput planning</text>
+      <text class="lbl-b" x="652" y="103" text-anchor="middle">6. Throughput planning</text>
       <text class="lbl-sm" x="652" y="120" text-anchor="middle">capacity model, not AI</text>
       <text class="lbl-sm" x="652" y="134" text-anchor="middle">finds the bottleneck stage</text>
       <text class="lbl-sm" x="652" y="148" text-anchor="middle">uses measured model speed</text>
@@ -168,7 +175,7 @@
         <tr><td>Confidence figures</td><td>Raw softmax outputs. <strong>Not calibrated probabilities.</strong> A reading of 100% is not 100% certainty; it means the image sits far on one side of the decision boundary.</td></tr>
         <tr><td>Grad-CAM</td><td>Real gradients from the loaded model. Coarse by nature, so a region boundary means "somewhere around here", not an outline.</td></tr>
         <tr><td>Lesion candidates</td><td>Classical morphology, no learning, independent of the classifier. <strong>Candidates, not findings.</strong> No accuracy is claimed, because none has been measured against ground truth.</td></tr>
-        <tr><td>Severity grade</td><td><strong>Not produced.</strong> No validated five-class model was available to load, and deriving one from a two-class output would be a fabrication.</td></tr>
+        <tr><td>Severity grade</td><td>The published ICDR rule applied to <strong>unvalidated candidates</strong>. It is what the rule yields if those candidates were confirmed, which is a projection rather than a diagnosis. It <strong>cannot exclude severe or proliferative disease</strong>, because venous beading, IRMA and neovascularisation are all undetectable by this method.</td></tr>
         <tr><td>Sensitivity and specificity</td><td><strong>Not claimed.</strong> No peer-reviewed validation exists for this exact model, so no figures are quoted.</td></tr>
         <tr><td>Throughput simulation</td><td>Arithmetic on your own inputs, with model speed measured live on your device. A planning aid, not a clinical result.</td></tr>
       </tbody>

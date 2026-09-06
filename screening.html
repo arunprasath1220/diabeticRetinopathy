@@ -147,9 +147,23 @@
     <p class="small">It cannot be loaded here as things stand. It ships as PyTorch <code>safetensors</code>, and a browser cannot run those. Reaching this page needs three steps on a machine with Python and PyTorch: export the checkpoint to ONNX, then either serve it with ONNX Runtime Web or convert it onward to TensorFlow.js, and host the result at a URL that permits cross-origin requests, as the classifier in Step 2 already is. None of that can happen inside a single HTML file, which is why the morphological detector is what runs today. The honest summary is that the accurate option is a packaging problem rather than a research one.</p>
   </section>
 
-<section id="step5" class="step">
+
+  <!-- SEVERITY ESTIMATE -->
+  <section id="severity" class="step">
     <hr class="rule">
     <span class="pill">Step 5</span>
+    <h2>ICDR severity estimate</h2>
+    <p class="notice">This applies the published International Clinical Diabetic Retinopathy rule to
+    the <em>candidates</em> from Step 4. The rule is followed faithfully; the counts it is fed are not
+    validated. So this is what the grading rule yields <strong>if</strong> those candidates were
+    confirmed findings, which is a projection, not a diagnosis.</p>
+    <div id="grade-result"></div>
+    <div id="grade-quadrants"></div>
+  </section>
+
+<section id="step5" class="step">
+    <hr class="rule">
+    <span class="pill">Step 6</span>
     <h2>Screening throughput simulation</h2>
     <p class="notice">This step is a planning simulation, not part of the AI model. A production version of this analysis would be built as a Simulink model in MATLAB; this is a lightweight JavaScript stand-in for planning purposes only.</p>
 
@@ -191,6 +205,11 @@
     <a href="https://www.kaggle.com/vbookshelf/dr-mobilenet-binary-classifier-tfjs-web-app" target="_blank" rel="noopener">"DR - MobileNet Binary Classifier + TFJS Web App"</a>
     on the <a href="https://www.kaggle.com/c/aptos2019-blindness-detection" target="_blank" rel="noopener">APTOS 2019 Blindness Detection</a> dataset. Weights are loaded at runtime from that public repository; no formal peer-reviewed sensitivity/specificity has been published for this exact model, so none is claimed here. This is a research/hackathon prototype, not a certified diagnostic device.</p>
   </footer>
+</div>
+
+<div class="refer-banner" id="refer-banner" role="alert" aria-live="polite">
+  <strong>Ask an ophthalmologist</strong>
+  <span id="refer-reason"></span>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
 <script src="js/app.js"></script>
