@@ -7,7 +7,10 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     line-height:1.55; font-size:15px; -webkit-font-smoothing:antialiased;
   }
-  .wrap{max-width:800px;margin:0 auto;padding:2.5rem 1.25rem 6rem;}
+  /* One width for every page. The capacity model needs 1120px for its block
+     diagram and stage table, and a screening page whose canvases are narrower
+     than the diagram page reads as two different sites. */
+  .wrap{max-width:1120px;margin:0 auto;padding:2.5rem 1.25rem 6rem;}
   header.app-header{margin-bottom:2rem;}
   h1{font-size:1.5rem;font-weight:700;margin:0 0 .35rem;letter-spacing:-.01em;}
   .subtitle{color:var(--grey4);font-size:.92rem;margin:0 0 1rem;}
@@ -160,7 +163,6 @@
      never carries a fact on its own here — the choke point is also labelled,
      also outlined heavily, and also listed in the table underneath, so the page
      works in greyscale and for a colour-blind reader. ---- */
-  .wrap-wide{max-width:1120px;}
   .model-grid{display:grid;grid-template-columns:minmax(0,1fr) 19rem;gap:1.75rem;align-items:start;}
   @media (max-width:900px){ .model-grid{grid-template-columns:minmax(0,1fr);} }
   .controls{border:1px solid var(--ink);padding:1rem 1.1rem;
