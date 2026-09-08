@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# MATLAB
+*.asv
+*.autosave
+slprj/
+*.slxc
+
+# Models (large binaries, not source)
+python/models/*.pt
+matlab/models/*.mat
+
+# OS
+.DS_Store
+Thumbs.db
