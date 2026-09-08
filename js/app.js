@@ -85,13 +85,36 @@
   // a single threshold cuts off, without admitting texture, which never produces
   // a strong enough core to start a region.
   const HYST_RATIO = 0.45;
-  // Vessel map. Vessels are identified morphologically: a closing removes dark
-  // structures thinner than the element, so what the closing filled in was thin
-  // and dark, i.e. a vessel. A round lesion is wider than the element, survives
-  // the closing, and is therefore never marked as vessel — which is what lets a
-  // lesion lying on a vessel be kept while the vessel itself is dropped.
-  const VESSEL_SE_FRAC = 0.012;
-  const VESSEL_K = 3.0;
+  // ---- Vessel map.
+  //
+  // A vessel is told from a lesion by the *spread* of the directional closing,
+  // not by the size of any one response. Closing along a line fills anything
+  // narrower than the element. At a vessel the element lying along it fills
+  // nothing, while every element crossing it fills it completely, so the
+  // responses across orientations are far apart. At a round lesion every
+  // orientation fills it about equally, so they are close together. The
+  // difference between the largest and smallest response — the anisotropy — is
+  // therefore near zero on a lesion and large on a vessel, whatever the calibre.
+  //
+  // The previous map thresholded the largest response on its own and then vetoed
+  // pixels whose smallest response was also large. Two absolute thresholds, and
+  // neither could hold across vessel calibres: measured against a ground-truth
+  // vessel tree it recovered 24.5% of vessel pixels and 3% of the thin ones, and
+  // produced 755 disconnected fragments where a vascular tree should be nearly
+  // one object. Three quarters of the vasculature was simply not being
+  // suppressed, which is where the marks on healthy retina were coming from.
+  //
+  // Comparing the two responses to each other instead of to a fixed number is
+  // scale-free, so one rule covers a thin peripheral capillary and a wide vein
+  // at the disc alike.
+  const VESSEL_ELONGATION = 1.5;
+  // Hysteresis quantiles on the anisotropy map. A vessel is confidently found
+  // somewhere along its length and then followed outward; this is what turns
+  // fragments into a tree and what recovers the faint thin vessels, which are
+  // never strong enough to clear a single global threshold but are always
+  // attached to something that is.
+  const VESSEL_SEED_Q = 0.95;
+  const VESSEL_GROW_Q = 0.80;
   // Half-length of the linear structuring element used to separate lesions from
   // vessels. Round structures up to about twice this across are filled by a
   // closing in every direction; a vessel is longer than it in the direction it
@@ -102,11 +125,93 @@
   // from the nearest element before that element walks off it; longer elements
   // need finer sampling to stay on a vessel.
   const LINEAR_ORIENTATIONS = 12;
-  // Seeding thresholds on the directional top-hat, in grey levels and in
-  // multiples of that map's own noise.
-  const SEED_K = 3.0;
+  // Seeding thresholds on the directional top-hat.
+  //
+  // The adaptive term is anchored to an upper quantile of the map rather than to
+  // a median absolute deviation, because MAD is the wrong statistic for this map
+  // and was silently doing nothing at all. A top-hat is non-negative by
+  // construction and more than half the retina responds at exactly zero, so the
+  // median sits on zero and the MAD measures the width of that zero atom rather
+  // than the noise. Measured on synthetic fundus images it comes out at about
+  // 0.56 grey levels, putting the adaptive threshold at 1.7 while the floor was
+  // 8 — so the floor decided every seed on every image and the claim that
+  // sensitivity followed the image was false. That is why the exposed control
+  // behaved like an on/off switch: it was the only thing connected to anything.
+  // An upper quantile sits in the tail where the signal actually is, so the
+  // threshold now tracks the camera, the exposure and the enhancement.
+  const SEED_TAIL_Q = 0.97;
+  // Backstops in grey levels, for an image whose tail estimate collapses — a
+  // near-uniform frame, or one where the retina barely fills the aperture.
   let SEED_FLOOR_DARK = 8;
   let SEED_FLOOR_BRIGHT = 10;
+  // ---- Scale saturation, the test that separates lesions from vessel geometry.
+  //
+  // Amplitude cannot do it. Measured over the retina, the top-hat response of a
+  // healthy fundus and of one carrying seventeen planted lesions are the same
+  // distribution out to the 99th percentile (15.1 vs 16.6 grey levels); they
+  // separate only past the 99.9th. So no threshold on response strength — which
+  // is the only axis the detector previously had — can tell a microaneurysm from
+  // a vessel crossing, a bifurcation or the apex of a bend. Raising the floor
+  // until the false marks disappear also takes the real lesions: at a floor of
+  // 20 the healthy retina still seeded 0.54% of its area while lesion recall had
+  // already fallen to 67%.
+  //
+  // What does separate them is boundedness. A lesion is a blob of finite width:
+  // once the structuring element is longer than the blob is wide, the closing
+  // already fills it completely, and making the element longer adds nothing. A
+  // vessel bend, a crossing, or a patch of choroidal mottling is not bounded —
+  // it continues past the element — so a longer element bridges more of it and
+  // the response keeps climbing. Measuring the same top-hat at two element
+  // lengths and taking the ratio therefore reads a property that neither the
+  // amplitude nor the shape of a single response can see.
+  //
+  // Measured on candidate regions: true lesions have a growth ratio of 1.00
+  // (quartiles 1.00-1.01) — completely saturated. False candidates sit at
+  // 1.46-1.57, and separate cleanly enough that the cut can be made close to 1.
+  //
+  // The test is applied on a ladder of element lengths rather than a single pair,
+  // and each region is judged at the rung that matches its own size. A single
+  // pair leaves a hole: a region wider than the short element has not saturated
+  // yet, so the test cannot speak for it and it must be exempted — and on a
+  // healthy retina that exemption is exactly where the survivors collect. Every
+  // false mark left on a healthy retina after the single-pair version was
+  // dot/blot sized, sitting in that gap. Judging a region against elements
+  // scaled to itself closes it: a blob of any size saturates at its own scale,
+  // while vessel geometry keeps growing at every scale.
+  //
+  // Introduced on its own, end to end over seven synthetic retinas against the
+  // same detector without it: false marks on a healthy retina fall from 15.6 per
+  // image to 7.9, false marks on a diseased one from 14.9 to 6.7, while lesion
+  // recall RISES from 72% to 76%. Precision and recall improve together because
+  // the test is not a threshold trade — it removes a class of structure rather
+  // than raising a bar everything has to clear. The cost is three directional
+  // passes per polarity instead of one.
+  //
+  // With the vessel map since repaired, the two together take false marks to 3.0
+  // per healthy image and 2.4 per diseased one, at 68% lesion recall and 86%
+  // exudate recall: precision 45% -> 83%, recall 72% -> 68%. The recall is spent
+  // on lesions lying on the vasculature, which is the same place the false marks
+  // were coming from.
+  //
+  // It degrades on genuinely noisy frames: at a noise level of 7 grey levels
+  // false marks climb back to 14 per healthy image and recall drops to 46%,
+  // because noise breaks a smooth structure into pieces that each look bounded.
+  // Below about 5 grey levels it is stable and needs no retuning per camera,
+  // which an amplitude threshold does not manage.
+  const SATURATION_SE_MULT = 2.0;
+  const SATURATION_LADDER = 3;              // seL, 2*seL, 4*seL
+  // The longer passes only need the size of the response, not a fine reading of
+  // which way each vessel runs, so they are sampled at half the angular
+  // resolution. Measured to change nothing and to halve the added cost.
+  const SATURATION_ORIENTATIONS = 6;
+  // Re-tuned once the vessel map was fixed. The two tests overlap: most of what
+  // the saturation test used to be the only defence against is now suppressed as
+  // vessel before it ever becomes a candidate, so the shape test no longer has to
+  // be strict enough to catch it alone. Measured against the repaired vessel map,
+  // loosening the cut from 1.05 to 1.10 recovers three lesions per three retinas
+  // for one extra false mark; past 1.15 the false marks climb without buying any
+  // further recall.
+  let SATURATION_MAX_GROWTH = 1.10;
   // A region is only discarded as vessel when this much of it lies on the vessel
   // map. Set too low, lesions touching a vessel are lost with it.
   const VESSEL_OVERLAP_REJECT = 0.78;
@@ -116,6 +221,79 @@
   const SMOOTH_GRADIENT_RATIO = 0.55;
   const MACULA_SMOOTH_AREA_FRAC = 0.08;
   const SMOOTH_BROAD_AREA_FRAC = 0.004;
+  // ---- Peripapillary bright suppression.
+  //
+  // The optic disc is the brightest thing in a normal fundus, so every bright
+  // candidate it produces is a false exudate. That was already meant to be
+  // handled by rejecting anything centred within 1.15 disc radii — but only as
+  // well as the radius was known, and the radius was the weak link.
+  //
+  // The radius came from the area of the plateau surviving a cut at 65% of the
+  // way from the *global* retinal mean up to the disc's own blurred peak. That is
+  // a fixed height on a soft-edged structure, and it consistently lands inside
+  // the rim: the plateau it leaves is the bright core, not the disc. On the
+  // synthetic scenes in this fix's harness it read 47 px for a 50 px disc and
+  // 50 px for a 52 px one — a few per cent small, which sounds harmless until it
+  // is multiplied by 1.15 and asked to reach past the rim. It does not. The rim
+  // itself, a scleral crescent beside it and the peripapillary reflex all sit in
+  // the gap between where the circle stops and where the disc actually ends, and
+  // every one of them is bright, round and sharply bounded — which is the exact
+  // description of a hard exudate. So they were reported as one: a scatter of
+  // bright marks ringing a disc the detector believed it had already excluded.
+  //
+  // Two things follow, and both are needed:
+  //
+  //   1. Measure the disc's extent instead of inferring it from a plateau area.
+  //      A flood fill from the disc centre, cut at a level referred to the
+  //      *peripapillary* background rather than the global mean, follows the
+  //      structure that is actually there. It is run twice: once at a high level
+  //      for the disc proper — the radius that gets drawn and that the existing
+  //      rejection circle uses — and once lower for the halo, disc plus crescent
+  //      plus reflex, which is the tissue a bright candidate must not be made of.
+  //
+  //   2. Judge what is left on colour. Beyond the halo there is still nerve-fibre
+  //      reflex and atrophic mottling, and no amount of geometry separates those
+  //      from an exudate, because in shape, size and contrast they are the same
+  //      thing. In colour they are not: exudate is lipid and reads yellow, while
+  //      disc tissue, sclera and reflex read white or grey. The reference for
+  //      "white" is read off the disc in the same image rather than fixed in
+  //      advance, so the test survives any white balance.
+  //
+  // Both rules are confined to bright candidates inside the peripapillary
+  // annulus. Nothing dark is touched, because nothing about the disc is dark and
+  // a hemorrhage beside it is a real finding; nothing in the macula or the
+  // periphery is touched at all.
+
+  // How far out from the disc centre the disc can still be the explanation for a
+  // bright mark, in disc radii. Peripapillary atrophy rarely reaches past this,
+  // and beyond it the colour reference stops being local enough to trust.
+  const PERIPAPILLARY_MULT = 2.5;
+  // Level, on the scale from peripapillary background to the disc's own plateau,
+  // at which the disc proper is called to end. Half way is where the half-maximum
+  // contour of a blurred edge sits, which is the edge itself.
+  const DISC_EDGE_LEVEL = 0.50;
+  // ...and the lower level that also takes in the crescent and the reflex. The
+  // ground between the two levels is the halo.
+  const DISC_HALO_LEVEL = 0.28;
+  // The fill is bounded so a washed-out frame cannot let it escape into open
+  // retina. Hitting a bound abandons the measurement rather than trusting it, and
+  // the old plateau estimate stands — a refusal is worth more than a wrong disc.
+  const DISC_FILL_MAX_MULT = 3.2;
+  // How much of a bright candidate must lie on measured disc tissue before the
+  // disc is accepted as its explanation. Deliberately not a majority: a real
+  // exudate does not overlap the disc at all, so anything with a third of itself
+  // built out of disc pixels is a piece of the disc that grew outward.
+  const DISC_TISSUE_OVERLAP = 0.33;
+  // Where a peripapillary candidate's blue fraction has to sit, on the scale from
+  // surrounding retina (0) to disc white (1), before colour calls it disc tissue.
+  // Above half, so a mark has to look more like the disc than like the retina it
+  // lies on; a yellow exudate lands well below.
+  const DISC_COLOUR_LEVEL = 0.55;
+  // Below this separation between disc and retinal blue fraction the reference is
+  // degenerate — a monochrome frame, or one with a heavy colour cast — and the
+  // colour test is skipped rather than answered on noise.
+  const DISC_COLOUR_MIN_SEPARATION = 0.02;
+
   // Above this many candidates, the detector is almost certainly firing on noise
   // rather than lesions, and the UI says so instead of presenting a tidy count.
   const NOISE_SUSPICION_COUNT = 400;
@@ -140,7 +318,6 @@
     camLayerName: null,
     workingCanvas: null,
     procCanvas: null,
-    measuredThroughputPerMin: null,
     lastQuality: null,
     lastGrading: null,
     lastGradcamDesc: null,
@@ -148,8 +325,7 @@
     lastAnatomy: null,
     lastFindings: null,
     lastLesions: null,
-    lastSeverity: null,
-    lastThroughput: null
+    lastSeverity: null
   };
 
   // ---------------------------------------------------------------------
@@ -695,11 +871,17 @@
     const w = canvas.width, h = canvas.height, n = w*h;
     const d = canvas.getContext("2d").getImageData(0,0,w,h).data;
     const lum = new Float32Array(n), green = new Float32Array(n);
+    // Red and blue are carried too. Nothing in the morphology uses them — that
+    // all runs on green and luminance — but telling lipid exudate from disc
+    // tissue is a question about hue, not about shape, and needs all three.
+    const red = new Float32Array(n), blue = new Float32Array(n);
     for (let i=0, p=0; i<d.length; i+=4, p++){
       green[p] = d[i+1];                                     // strongest blood contrast
+      red[p] = d[i];
+      blue[p] = d[i+2];
       lum[p] = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
     }
-    return { w, h, n, lum, green };
+    return { w, h, n, lum, green, red, blue };
   }
 
   // Centre and radius of the camera aperture, from the extent of the lit area.
@@ -815,6 +997,50 @@
     return out;
   }
 
+  // Grow the connected region containing (sx,sy) over everything at or above the
+  // cut, bounded in both radius and area. Returns null the moment either bound is
+  // passed: at that point the fill has left the structure it was asked to measure
+  // and is running into open retina, and no number it could return would mean
+  // anything. A refusal here leaves the caller's earlier estimate standing.
+  function floodBrightRegion(blur, inside, w, h, sx, sy, cut, maxR, maxArea){
+    const n = w*h;
+    const start = sy*w + sx;
+    if (!inside[start] || blur[start] < cut) return null;
+    const mask = new Uint8Array(n);
+    const stack = new Int32Array(n);
+    let sp = 0;
+    stack[sp++] = start; mask[start] = 1;
+    let area = 0, sumX = 0, sumY = 0;
+    const maxR2 = maxR*maxR;
+    function push(nb, nx, ny){
+      if (mask[nb] || !inside[nb] || blur[nb] < cut) return;
+      const dx = nx-sx, dy = ny-sy;
+      if (dx*dx + dy*dy > maxR2) return;
+      mask[nb] = 1; stack[sp++] = nb;
+    }
+    while (sp > 0){
+      const idx = stack[--sp];
+      const y = (idx/w)|0, x = idx - y*w;
+      area++; sumX += x; sumY += y;
+      if (area > maxArea) return null;
+      if (x > 0)   push(idx-1, x-1, y);
+      if (x < w-1) push(idx+1, x+1, y);
+      if (y > 0)   push(idx-w, x, y-1);
+      if (y < h-1) push(idx+w, x, y+1);
+    }
+    return { mask, area, cx: sumX/area, cy: sumY/area };
+  }
+
+  // Median of a sampled set, used for the two brightness references below. Both
+  // are read as medians rather than means because both regions are crossed by
+  // things that do not belong to them — vessels leaving the disc, the odd lesion
+  // in the surrounding ring — and a mean would follow them.
+  function medianOf(values){
+    if (!values.length) return null;
+    values.sort((a,b) => a-b);
+    return values[values.length >> 1];
+  }
+
   // Optic disc. Brightness alone picks the wrong region whenever the photo has a
   // specular highlight or a blown-out patch, so brightness is combined with local
   // contrast: the disc carries the vessel trunk and a sharp rim and is therefore
@@ -862,11 +1088,114 @@
       }
     }
 
+    const rMin = Math.min(w,h)*0.035, rMax = Math.min(w,h)*0.11;
+    let discX = area ? sumX/area : seedX;
+    let discY = area ? sumY/area : seedY;
+    let radius = clamp(Math.sqrt(Math.max(area,1)/Math.PI), rMin, rMax);
+
+    // ---- Measured extent, replacing the plateau area above wherever it can.
+    //
+    // The plateau is a cut at a fixed height above the mean of the whole retina,
+    // and the whole retina is not what the disc's edge is defined against. Two
+    // things go wrong with that. The reference is global, so any change in
+    // average brightness elsewhere in the frame moves the disc's boundary; and
+    // the height is fixed at 65% of the way to the peak, which on a soft-edged
+    // structure is a contour inside the rim rather than the rim itself. Both push
+    // the same way — the measured radius comes out a few per cent small, and the
+    // exclusion circle built on it stops short of the disc's own margin.
+    //
+    // Growing the region instead fixes both. The level is referred to the retina
+    // immediately around the disc, so it is local; and it is placed half way
+    // between that background and the disc, which is where the half-maximum
+    // contour of a blurred edge sits — the edge itself, rather than a contour
+    // some fixed distance inside it.
+    const cx0 = clampInt(Math.round(discX), 0, w-1);
+    const cy0 = clampInt(Math.round(discY), 0, h-1);
+    const r0 = radius;
+
+    // Peripapillary background: retina in an annulus outside the disc, close
+    // enough to share its illumination. The inner edge is held clear of the blur
+    // radius as well as of the disc, because the same blur that makes the disc a
+    // plateau also spreads it outward, and an annulus inside that spill would
+    // read the disc back as its own background and shrink the fill to nothing.
+    const ringInner = Math.max(r0*2.5, r0 + r*1.5);
+    const ringOuter = Math.max(ringInner*1.6, r0*4.0);
+    const ring = [];
+    {
+      const i2 = ringInner*ringInner, o2 = ringOuter*ringOuter;
+      const ya = Math.max(0, Math.round(cy0-ringOuter)), yb = Math.min(h-1, Math.round(cy0+ringOuter));
+      const xa = Math.max(0, Math.round(cx0-ringOuter)), xb = Math.min(w-1, Math.round(cx0+ringOuter));
+      for (let y=ya; y<=yb; y++){
+        const dy = y-cy0;
+        for (let x=xa; x<=xb; x++){
+          const dx = x-cx0, d2 = dx*dx + dy*dy;
+          if (d2 < i2 || d2 > o2) continue;
+          const i = y*w+x;
+          if (inside[i]) ring.push(blur[i]);
+        }
+      }
+    }
+    // Too few pixels means the disc sits near the edge of the aperture and no
+    // annulus fits; the global mean is a worse reference but it is the only one
+    // left, and it errs toward a smaller fill rather than a runaway one.
+    const ppBg = (ring.length > 200 ? medianOf(ring) : mean);
+
+    // The disc's own level, as a high quantile of its core rather than the single
+    // brightest pixel in it, so one specular speck on the cup cannot set the
+    // scale that both cuts are measured against.
+    const core = [];
+    {
+      const rc = Math.max(2, r0*0.6), rc2 = rc*rc;
+      for (let y=Math.max(0,Math.round(cy0-rc)); y<=Math.min(h-1,Math.round(cy0+rc)); y++){
+        const dy = y-cy0;
+        for (let x=Math.max(0,Math.round(cx0-rc)); x<=Math.min(w-1,Math.round(cx0+rc)); x++){
+          const dx = x-cx0;
+          if (dx*dx + dy*dy > rc2) continue;
+          const i = y*w+x;
+          if (inside[i]) core.push(blur[i]);
+        }
+      }
+      core.sort((a,b) => a-b);
+    }
+    const discLevel = core.length
+      ? core[Math.min(core.length-1, Math.floor(core.length*0.75))]
+      : blur[bestIdx];
+
+    let tissue = null, measuredExtent = false;
+    const span = discLevel - ppBg;
+    // A span of a grey level or less means the disc is not separable from the
+    // retina around it on this frame. Anything grown from that is noise, so
+    // nothing is grown and the plateau estimate is left to stand alone.
+    if (span > 1){
+      const maxR = r0*DISC_FILL_MAX_MULT;
+      const maxArea = Math.PI*Math.pow(r0*2.8, 2);
+      const edge = floodBrightRegion(blur, inside, w, h, cx0, cy0, ppBg + span*DISC_EDGE_LEVEL, maxR, maxArea);
+      if (edge){
+        radius = clamp(Math.sqrt(edge.area/Math.PI), rMin, rMax);
+        discX = edge.cx; discY = edge.cy;
+        tissue = edge.mask;
+        measuredExtent = true;
+      }
+      // The halo takes in whatever the disc shades into: the rim it was grown
+      // from, a scleral crescent beside it, the nerve-fibre reflex arcing off it.
+      // It supersedes the edge mask when it can be grown, being the larger of the
+      // two and the one the bright-candidate test actually wants.
+      const halo = floodBrightRegion(blur, inside, w, h, cx0, cy0, ppBg + span*DISC_HALO_LEVEL, maxR, maxArea);
+      if (halo) tissue = halo.mask;
+    }
+
     return {
-      x: area ? sumX/area : seedX,
-      y: area ? sumY/area : seedY,
-      radius: clamp(Math.sqrt(Math.max(area,1)/Math.PI), Math.min(w,h)*0.035, Math.min(w,h)*0.11),
-      score: best
+      x: discX,
+      y: discY,
+      radius,
+      score: best,
+      // The tissue the disc is actually made of, at the resolution of the canvas
+      // it was measured on — both dimensions travel with it, because a mask
+      // indexed against the wrong size would delete findings somewhere else in
+      // the image without saying so. Null when the fill could not be trusted, in
+      // which case the exclusion circle stands on its own as it did before.
+      tissue, tissueW: w, tissueH: h,
+      measuredExtent
     };
   }
 
@@ -1280,7 +1609,9 @@
     const nasalWord = anatomy.nasalSide === "left" ? "left" : "right";
     const temporalWord = anatomy.nasalSide === "left" ? "right" : "left";
     t.innerHTML = `
-      <tr><td>Optic disc centre (estimated)</td><td>x ${Math.round(anatomy.disc.x)}, y ${Math.round(anatomy.disc.y)} px · radius ${Math.round(anatomy.disc.radius)} px, measured from the bright region rather than assumed</td></tr>
+      <tr><td>Optic disc centre (estimated)</td><td>x ${Math.round(anatomy.disc.x)}, y ${Math.round(anatomy.disc.y)} px · radius ${Math.round(anatomy.disc.radius)} px<br><span class="small">${anatomy.disc.measuredExtent
+        ? "grown outward from the disc's own brightness down to the half-way level between it and the retina immediately around it, so the radius follows the rim rather than the area of whatever plateau a global threshold happened to leave"
+        : "from the area of the bright plateau — the extent could not be grown on this image, so this radius may undersize the disc"}</span></td></tr>
       <tr><td>Fovea centre (estimated)</td><td>x ${Math.round(anatomy.fovea.x)}, y ${Math.round(anatomy.fovea.y)} px<br><span class="small">${anatomy.evidence || "method not recorded"}</span></td></tr>
       <tr><td>Macula (estimated)</td><td>circle of radius ${Math.round(anatomy.maculaRadius)} px around the fovea</td></tr>
       <tr><td>Nasal side of frame</td><td>${nasalWord} of the disc axis (the disc is nasal to the fovea in either eye)</td></tr>
@@ -1588,40 +1919,162 @@
     return { min: accMin, max: accMax };
   }
 
+  // Upper-quantile anchor for a one-sided map. robustSigma is the right tool for
+  // the symmetric deviation maps, where the median really is the background and
+  // the MAD really is the noise. It is the wrong tool for a top-hat, which is
+  // non-negative and piles most of its mass on zero: there the MAD describes the
+  // zero atom and ignores the tail entirely. This reads the tail directly.
+  function tailQuantile(map, mask, n, q){
+    const BINS = 2048, HI = 128, sc = BINS/HI;
+    const step = n > 300000 ? 2 : 1;
+    const hist = new Int32Array(BINS);
+    let count = 0;
+    for (let i=0;i<n;i+=step){
+      if (!mask[i]) continue;
+      let v = map[i];
+      if (v < 0) v = 0; else if (v > HI-0.001) v = HI-0.001;
+      hist[(v*sc)|0]++;
+      count++;
+    }
+    if (!count) return 1;
+    const target = count*q;
+    let cum = 0;
+    for (let b=0;b<BINS;b++){
+      cum += hist[b];
+      if (cum >= target) return (b+0.5)/sc;
+    }
+    return HI;
+  }
+
+  // Flood a strong mask outward through a permissive one. Both masks are already
+  // gated on the same evidence, so this only ever connects what the permissive
+  // threshold already believed; what it adds is the requirement that a weak pixel
+  // be attached to a confident one, which is exactly what distinguishes the faint
+  // continuation of a real vessel from an isolated patch of texture at the same
+  // amplitude. Eight-connected, because a vessel crossing the pixel grid at an
+  // angle is a staircase and four-connectivity breaks it into beads.
+  function hysteresisMask(strong, weak, w, h){
+    const n = w*h;
+    const out = new Uint8Array(n);
+    const stack = new Int32Array(n);
+    let sp = 0;
+    for (let i=0;i<n;i++) if (strong[i]){ out[i] = 1; stack[sp++] = i; }
+    while (sp > 0){
+      const idx = stack[--sp];
+      const y = (idx/w)|0, x = idx - y*w;
+      for (let dy=-1; dy<=1; dy++){
+        const ny = y+dy;
+        if (ny < 0 || ny >= h) continue;
+        for (let dx=-1; dx<=1; dx++){
+          const nx = x+dx;
+          if (nx < 0 || nx >= w) continue;
+          const nb = ny*w + nx;
+          if (!out[nb] && weak[nb]){ out[nb] = 1; stack[sp++] = nb; }
+        }
+      }
+    }
+    return out;
+  }
+
   function roundStructureSeeds(greenS, lumS, inside, w, h){
     const n = w*h;
     const seL = Math.max(3, Math.round(Math.min(w,h)*LINEAR_SE_FRAC));
     const closed = directionalMorph(greenS, w, h, seL, "close");
     const opened = directionalMorph(lumS, w, h, seL, "open");
 
+    // The same two top-hats at successively longer elements. Everything bounded
+    // has already been filled at its own scale and does not respond any harder
+    // at the next rung; everything that continues past the element does. The
+    // difference between consecutive rungs is the saturation test.
+    const satSE = [seL];
+    const satDark = [], satBright = [];
+    for (let k=1; k<SATURATION_LADDER; k++){
+      satSE.push(Math.max(satSE[k-1]+1, Math.round(seL*Math.pow(SATURATION_SE_MULT, k))));
+    }
+
     const roundDark = new Float32Array(n);
     const roundBright = new Float32Array(n);
-    const thinDark = new Float32Array(n);
+    // Spread of the closing across orientations: near zero where every direction
+    // filled the structure equally (round), large where one direction filled
+    // nothing and the rest filled completely (elongated).
+    const anisoDark = new Float32Array(n);
     for (let i=0;i<n;i++){
       if (!inside[i]) continue;
       const rd = closed.min[i] - greenS[i];      // filled by every direction: round
-      const td = closed.max[i] - greenS[i];      // filled by some direction: thin
       const rb = lumS[i] - opened.max[i];
       roundDark[i] = rd > 0 ? rd : 0;
-      thinDark[i] = td > 0 ? td : 0;
       roundBright[i] = rb > 0 ? rb : 0;
+      const an = closed.max[i] - closed.min[i];
+      anisoDark[i] = an > 0 ? an : 0;
+    }
+    satDark.push(roundDark); satBright.push(roundBright);
+    for (let k=1; k<satSE.length; k++){
+      const cB = directionalMorph(greenS, w, h, satSE[k], "close", SATURATION_ORIENTATIONS);
+      const oB = directionalMorph(lumS, w, h, satSE[k], "open", SATURATION_ORIENTATIONS);
+      const dk = new Float32Array(n), br = new Float32Array(n);
+      for (let i=0;i<n;i++){
+        if (!inside[i]) continue;
+        const a = cB.min[i] - greenS[i];
+        const b = lumS[i] - oB.max[i];
+        dk[i] = a > 0 ? a : 0;
+        br[i] = b > 0 ? b : 0;
+      }
+      satDark.push(dk); satBright.push(br);
     }
 
-    const tDark = Math.max(SEED_FLOOR_DARK, robustSigma(roundDark, inside, n)*SEED_K);
-    const tBright = Math.max(SEED_FLOOR_BRIGHT, robustSigma(roundBright, inside, n)*SEED_K);
-    const tThin = Math.max(5, robustSigma(thinDark, inside, n)*VESSEL_K);
+    const tDark = Math.max(SEED_FLOOR_DARK, tailQuantile(roundDark, inside, n, SEED_TAIL_Q));
+    const tBright = Math.max(SEED_FLOOR_BRIGHT, tailQuantile(roundBright, inside, n, SEED_TAIL_Q));
 
     const darkSeed = new Uint8Array(n), brightSeed = new Uint8Array(n);
-    const vesselMask = new Uint8Array(n);
     for (let i=0;i<n;i++){
       if (!inside[i]) continue;
       if (roundDark[i] > tDark) darkSeed[i] = 1;
       if (roundBright[i] > tBright) brightSeed[i] = 1;
-      // Thin in some direction but not round in all of them: a vessel.
-      if (thinDark[i] > tThin && roundDark[i] < tDark*0.6) vesselMask[i] = 1;
     }
 
-    return { darkSeed, brightSeed, vesselMask };
+    // Vessel map: elongated where the closing's spread across orientations
+    // dominates its floor. The comparison is between the two responses rather
+    // than against a fixed level, so the same rule holds for a thin peripheral
+    // capillary and a wide vein without either being tuned for. Found at a strict
+    // level and followed outward at a permissive one, so a vessel is traced along
+    // its length instead of appearing only where it happens to be darkest.
+    const tVesselSeed = Math.max(3, tailQuantile(anisoDark, inside, n, VESSEL_SEED_Q));
+    const tVesselGrow = Math.max(2, tailQuantile(anisoDark, inside, n, VESSEL_GROW_Q));
+    const vSeed = new Uint8Array(n), vGrow = new Uint8Array(n);
+    for (let i=0;i<n;i++){
+      if (!inside[i]) continue;
+      // Elongated: the spread outruns what every direction filled in common. A
+      // lesion fails this however dark it is, which is what stops the vessel map
+      // from swallowing the findings it exists to protect.
+      if (anisoDark[i] <= VESSEL_ELONGATION*roundDark[i]) continue;
+      if (anisoDark[i] > tVesselSeed) vSeed[i] = 1;
+      if (anisoDark[i] > tVesselGrow) vGrow[i] = 1;
+    }
+    const vesselMask = hysteresisMask(vSeed, vGrow, w, h);
+
+    // Seeding stays on the shortest element, and the reason is worth recording
+    // because the obvious improvement was measured and rejected.
+    //
+    // A closing only fills a structure narrower than the element, so a blot
+    // hemorrhage wider than the element barely responds: on a planted hemorrhage
+    // of radius 20 the mean top-hat at the nominal element is 0.4 grey levels and
+    // not one of its 1257 pixels seeds, while at twice and four times that length
+    // it answers at 25.4 and 34.7. Since a seed is mandatory, such a lesion can
+    // never be reported however obvious it is. That is the real cause of the
+    // large-hemorrhage blindness, and it is a property of the seeding scale, not
+    // of the vessel-rejection rule the notes previously blamed.
+    //
+    // Seeding from the longer rungs as well does fix the seeding, and does not
+    // fix the detection: the newly seeded regions are then rejected at the
+    // contrast test instead, because a long element also responds to the macula
+    // and to illumination falloff, which arrive together with the hemorrhages.
+    // Measured over three retinas it raised false marks on healthy images from 19
+    // to 29 while recovering one large hemorrhage out of six. The gap is real but
+    // it lives further down, in how extent and contrast are measured, and adding
+    // scales to the seeder only moves the failure rather than removing it.
+
+    return { darkSeed, brightSeed, vesselMask, seL, satSE, satDark, satBright,
+             roundDark, roundBright, tDark, tBright };
   }
 
   // ---------------------------------------------------------------------
@@ -1797,7 +2250,7 @@
   }
 
   function detectLesionCandidates(canvas, anatomy){
-    const { w, h, n, lum, green } = imageChannels(canvas);
+    const { w, h, n, lum, green, red, blue } = imageChannels(canvas);
 
     const inside = retinaFieldMask(lum, w, h, 0.05);
     let retinaArea = 0;
@@ -1829,6 +2282,96 @@
     // removes every small lesion along with the vessels.
     const vesselMask = seeds.vesselMask;
     const vesselZone = dilateMask(vesselMask, w, h, 1);
+
+    // ---- Scale saturation.
+    // Which rung of the ladder speaks for a region of this size: the first
+    // element at least as wide as the region is across. Below that the region has
+    // not saturated yet and the ratio would only measure how much of it is still
+    // being filled in; at that rung and above, a bounded blob is already complete.
+    // Widest structure the ladder can still speak for. Past this the longest
+    // element no longer fills the region, so no rung can show saturation and
+    // silence must not be read as a verdict — this is what keeps a genuinely
+    // large blot hemorrhage from being deleted by a rule that was never about it.
+    const satMaxArea = Math.PI*Math.pow(seeds.satSE[seeds.satSE.length-1], 2);
+
+    function satRung(c){
+      const r = Math.sqrt(Math.max(c.area,1)/Math.PI);
+      for (let k=0; k<seeds.satSE.length-1; k++){
+        if (seeds.satSE[k] >= r) return k;
+      }
+      return -1;                              // wider than the longest element
+    }
+
+    // Measured over a disc centred on the region rather than over the region's
+    // own pixels, and only where the response clears a core level.
+    //
+    // Two reasons. The faint margins a region is grown out to carry almost no
+    // top-hat response at any element length, so including them drives both means
+    // toward zero and the ratio toward noise. More importantly the region's pixel
+    // list is not the structure: vessel pixels are removed from what a region may
+    // grow into, so a lesion touching a vessel is truncated, and what survives is
+    // the part of it furthest from the vessel — its own rim, which is exactly the
+    // shape that reads as unbounded. Measured that way the test rejected real
+    // lesions as soon as the vessel map became dense enough to bite: on one
+    // retina it took five of them. Sampling the image around the region instead
+    // keeps the test on the evidence rather than on the bookkeeping.
+    function growthRatio(c, dark, k){
+      const maps  = dark ? seeds.satDark : seeds.satBright;
+      const small = maps[k], big = maps[k+1];
+      const core  = (dark ? seeds.tDark : seeds.tBright)*0.5;
+      const rad   = Math.max(3, Math.round(Math.sqrt(Math.max(c.area,1)/Math.PI)) + 1);
+      const x0 = Math.max(0, Math.round(c.cx)-rad), x1 = Math.min(w-1, Math.round(c.cx)+rad);
+      const y0 = Math.max(0, Math.round(c.cy)-rad), y1 = Math.min(h-1, Math.round(c.cy)+rad);
+      const r2 = rad*rad;
+      let a = 0, b = 0, m = 0;
+      for (let y=y0; y<=y1; y++){
+        const dy = y - c.cy;
+        for (let x=x0; x<=x1; x++){
+          const dx = x - c.cx;
+          if (dx*dx + dy*dy > r2) continue;
+          const i = y*w + x;
+          if (!inside[i] || small[i] < core) continue;
+          // Vessel pixels are excluded from the measurement, not merely from the
+          // region. A lesion sitting beside a vessel is otherwise measured partly
+          // on the vessel, and a vessel is the one thing that keeps responding
+          // harder as the element grows — so the lesion inherits its neighbour's
+          // growth and is rejected for it. Measured on one retina the affected
+          // lesions came out between 1.08 and 1.37 against a cut of 1.05, while
+          // lesions in open retina sit at 1.00. This is the vessel map being used
+          // to protect a finding rather than to suppress one.
+          if (vesselMask[i]) continue;
+          a += small[i]; b += big[i]; m++;
+        }
+      }
+      if (m < 3 || a <= 0) return null;      // no responding core to judge
+      return b/a;
+    }
+    // A bounded blob is already filled at the element matching its own width, so
+    // the next element up adds nothing; anything that continues past the element
+    // keeps gaining at every rung. A region wider than the longest element is
+    // exempt, because there the test is silent rather than negative — that is
+    // what keeps a genuinely large blot hemorrhage from being deleted by a rule
+    // that was never about it.
+    // Bounded at any scale is bounded. Rather than picking the rung that ought to
+    // suit the region's size and trusting that one answer, every rung is asked and
+    // the region passes if any of them finds it saturated.
+    //
+    // Choosing a rung from the region's own area was tried first and is not safe,
+    // because the area is not the structure's: vessel pixels are removed from what
+    // a region may grow into, so a lesion touching a vessel is truncated and reads
+    // as smaller than it is. That sends it to a shorter element than belongs to
+    // it, where nothing of its size could have saturated, and it is rejected for
+    // failing a test that was asked at the wrong scale. Asking every rung removes
+    // the guess: a lesion answers at whichever rung matches it, and a vessel bend
+    // answers at none, which is the actual distinction being drawn.
+    function failsSaturation(c, dark){
+      if (c.area > satMaxArea) return false;
+      const k = satRung(c);
+      if (k < 0) return false;
+      const g = growthRatio(c, dark, k);
+      if (g === null) return false;
+      return g > SATURATION_MAX_GROWTH;
+    }
 
     // Backgrounds exclude both the black surround and the vessels; a vessel in
     // the averaging window drags the background down and makes ordinary retina
@@ -1879,10 +2422,22 @@
     for (let i=0;i<n;i++){
       if (vesselMask[i]){ darkLoose[i] = 0; brightLoose[i] = 0; }
     }
-    // A seed must always be able to grow from itself.
+    // A seed must always be able to grow from itself, and a lesion's own body must
+    // survive the vessel map crossing it.
+    //
+    // Restoring only the seeds is not enough once the vessel map is dense and
+    // accurate. A lesion lying against a vessel has its seed restored but the rest
+    // of its body deleted, so what is left to grow from is the sliver furthest
+    // from the vessel — the lesion's own rim, which is the one shape that reads as
+    // unbounded, and it is then thrown out by the saturation test. Restoring every
+    // pixel that still carries lesion evidence repairs the body instead of just
+    // its core. It cannot re-admit the vessel, because this is the roundness
+    // response and a vessel barely produces one: that is the whole basis on which
+    // the vessel map was built.
+    const darkKeep = seeds.tDark*HYST_RATIO, brightKeep = seeds.tBright*HYST_RATIO;
     for (let i=0;i<n;i++){
-      if (darkSeed[i]) darkLoose[i] = 1;
-      if (brightSeed[i]) brightLoose[i] = 1;
+      if (darkSeed[i] || seeds.roundDark[i] > darkKeep) darkLoose[i] = 1;
+      if (brightSeed[i] || seeds.roundBright[i] > brightKeep) brightLoose[i] = 1;
     }
 
     let gradSum = 0, gradCount = 0;
@@ -1899,6 +2454,85 @@
     function nearDisc(x, y, mult){
       if (!anatomy) return false;
       return Math.hypot(x-anatomy.disc.x, y-anatomy.disc.y) <= discR*mult;
+    }
+
+    // ---- Peripapillary bright suppression, part one: measured disc tissue.
+    //
+    // The dimensions are checked rather than assumed. Landmarks and detection run
+    // on the same canvas today, but a mask indexed against a different size would
+    // not fail loudly — it would quietly delete findings somewhere else in the
+    // image, which is the worst way for this to go wrong.
+    const discTissue = (anatomy && anatomy.disc.tissue &&
+                        anatomy.disc.tissueW === w && anatomy.disc.tissueH === h)
+                       ? anatomy.disc.tissue : null;
+
+    function discTissueFrac(c){
+      if (!discTissue) return 0;
+      let on = 0;
+      for (let i=0;i<c.pixels.length;i++) if (discTissue[c.pixels[i]]) on++;
+      return c.pixels.length ? on/c.pixels.length : 0;
+    }
+
+    // ---- Part two: colour.
+    //
+    // Past the halo there is still nerve-fibre reflex and atrophic mottling, and
+    // in shape, size and contrast those are indistinguishable from a hard
+    // exudate — which is why every geometric rule tried here left some of them
+    // standing. What separates them is what they are made of. An exudate is lipid
+    // and reads yellow: it gains in red and green and hardly at all in blue.
+    // Disc tissue, sclera and reflex are white or grey and gain in all three, so
+    // their blue fraction climbs while an exudate's stays near the retina's.
+    //
+    // Both ends of the scale are read off this image — disc tissue for white,
+    // surrounding retina for the other end — so nothing here depends on the
+    // camera's white balance, and an image where the two ends do not separate is
+    // one where the test says nothing rather than one where it guesses.
+    function blueFraction(i){
+      const sum = red[i] + green[i] + blue[i];
+      return sum > 24 ? blue[i]/sum : -1;    // too dark to carry a readable hue
+    }
+
+    const discColour = (function(){
+      if (!anatomy || discR <= 0) return null;
+      const onDisc = [], onRetina = [];
+      const reach = discR*PERIPAPILLARY_MULT*1.6;
+      const cx = anatomy.disc.x, cy = anatomy.disc.y;
+      const reach2 = reach*reach, far2 = (discR*1.6)*(discR*1.6);
+      const core2 = discR*discR*0.64;
+      for (let y=Math.max(0,Math.round(cy-reach)); y<=Math.min(h-1,Math.round(cy+reach)); y++){
+        const dy = y-cy;
+        for (let x=Math.max(0,Math.round(cx-reach)); x<=Math.min(w-1,Math.round(cx+reach)); x++){
+          const dx = x-cx, d2 = dx*dx + dy*dy;
+          if (d2 > reach2) continue;
+          const i = y*w+x;
+          if (!inside[i]) continue;
+          const f = blueFraction(i);
+          if (f < 0) continue;
+          // White reference: measured disc tissue where the extent could be
+          // grown, the inner core of the circle otherwise — that core is disc
+          // whether or not the radius around it was right.
+          if (discTissue ? discTissue[i] : d2 <= core2){ onDisc.push(f); continue; }
+          // Retina reference: outside the rim and off the vessels, so neither the
+          // disc's own edge nor a vessel's blood colour sets the other end.
+          if (d2 > far2 && !(discTissue && discTissue[i]) && !vesselZone[i]) onRetina.push(f);
+        }
+      }
+      if (onDisc.length < 200 || onRetina.length < 200) return null;
+      const discF = medianOf(onDisc), retinaF = medianOf(onRetina);
+      if (discF - retinaF < DISC_COLOUR_MIN_SEPARATION) return null;
+      return { discF, retinaF, cut: retinaF + (discF-retinaF)*DISC_COLOUR_LEVEL };
+    })();
+
+    function looksLikeDiscTissue(c){
+      if (!discColour) return false;
+      let sum = 0, m = 0;
+      for (let i=0;i<c.pixels.length;i++){
+        const f = blueFraction(c.pixels[i]);
+        if (f < 0) continue;
+        sum += f; m++;
+      }
+      if (m < 3) return false;
+      return (sum/m) >= discColour.cut;
     }
     const hasMacula = !!(anatomy && anatomy.fovea);
     const ap = apertureGeometry(lum, w, h);
@@ -1921,7 +2555,7 @@
     const junctionArmLen = seLen*1.5;
 
     const candidates = [];
-    const rejected = { vessel:0, junction:0, tooLarge:0, tooSmall:0, disc:0, weak:0, streak:0, noSeed:0, macula:0, smooth:0, edge:0 };
+    const rejected = { vessel:0, junction:0, tooLarge:0, tooSmall:0, disc:0, discTissue:0, discColour:0, weak:0, streak:0, noSeed:0, macula:0, smooth:0, edge:0, unbounded:0 };
 
     const darkCovered = new Uint8Array(n), brightCovered = new Uint8Array(n);
 
@@ -1941,6 +2575,20 @@
         if (c.area < minArea){ rejected.tooSmall++; return; }
         if (c.area > maxArea){ rejected.tooLarge++; return; }
         if (nearDisc(c.cx, c.cy, 1.15)){ rejected.disc++; return; }
+        // Outside that circle the disc can still be the explanation for a bright
+        // mark: the rim it was grown from, a crescent of sclera beside it, the
+        // nerve-fibre reflex arcing off it. Two independent ways of saying so,
+        // either sufficient — the mark is built out of measured disc tissue, or
+        // it is the colour of disc tissue rather than the colour of exudate.
+        //
+        // Dark candidates are deliberately exempt. Nothing about the disc is
+        // dark, so a dark mark beside it is a hemorrhage and has to survive; and
+        // the disc's own margin is where a disc hemorrhage sits, which is a
+        // finding worth more than everything this rule removes.
+        if (!dark && nearDisc(c.cx, c.cy, PERIPAPILLARY_MULT)){
+          if (discTissueFrac(c) >= DISC_TISSUE_OVERLAP){ rejected.discTissue++; return; }
+          if (looksLikeDiscTissue(c)){ rejected.discColour++; return; }
+        }
         if (isEdgeArtifact(c)){ rejected.edge++; return; }
         if (c.aspect > 4.0 && c.fillRatio < 0.30){ rejected.streak++; return; }
 
@@ -1948,6 +2596,12 @@
         // whatever seeded it. The threshold is high on purpose: a lesion touching
         // a vessel overlaps it partially, and must survive.
         if (vesselOverlapFrac(c) > VESSEL_OVERLAP_REJECT){ rejected.vessel++; return; }
+
+        // Crossings, bifurcations, bends and choroidal mottling answer the
+        // roundness test at one element length the same way a lesion does. They
+        // are told apart by whether the response stops growing when the element
+        // does: a lesion is bounded, they are not.
+        if (failsSaturation(c, dark)){ rejected.unbounded++; return; }
 
         // Crossings, bifurcations and tight bends answer the roundness test the
         // same way a lesion does. They are told apart by what runs out of them.
@@ -2017,6 +2671,9 @@
       noise: { dark: noiseDark, bright: noiseBright },
       scales,
       discExcluded: !!anatomy,
+      discExtentMeasured: !!(anatomy && anatomy.disc.measuredExtent),
+      discTissueMask: !!discTissue,
+      discColourUsed: !!discColour,
       maculaExcluded: hasMacula
     };
   }
@@ -2314,10 +2971,12 @@
       const noisy = total > NOISE_SUSPICION_COUNT;
       const capped = total > OVERLAY_CIRCLE_LIMIT;
       summary.innerHTML = `<p><strong>${total} candidate region${total===1?"":"s"}</strong> covering ${lesions.lesionPixels.toLocaleString()} px, ${pctOfRetina.toFixed(2)}% of the retinal area.
-        Rejected during filtering: ${lesions.rejected.vessel} as vessel or vessel fragment, ${lesions.rejected.junction} as vessel crossings, bifurcations or bends, ${lesions.rejected.weak} as too faint against the noise floor, ${lesions.rejected.tooLarge} as too large, ${lesions.rejected.tooSmall} as too small, ${lesions.rejected.streak} as bright streaks, ${lesions.rejected.disc} inside the optic disc, ${lesions.rejected.edge} as large regions at the edge of the aperture, ${lesions.rejected.macula} as macular pigmentation, ${lesions.rejected.smooth} as broad smooth shading, ${lesions.rejected.noSeed} for having no core strong enough to seed a region.
+        Rejected during filtering: ${lesions.rejected.vessel} as vessel or vessel fragment, ${lesions.rejected.junction} as vessel crossings, bifurcations or bends, ${lesions.rejected.unbounded} as unbounded structures whose response kept growing with the measuring element, ${lesions.rejected.weak} as too faint against the noise floor, ${lesions.rejected.tooLarge} as too large, ${lesions.rejected.tooSmall} as too small, ${lesions.rejected.streak} as bright streaks, ${lesions.rejected.disc} inside the optic disc, ${lesions.rejected.discTissue} as bright regions built out of measured disc tissue, ${lesions.rejected.discColour} as peripapillary marks the colour of disc or sclera rather than of exudate, ${lesions.rejected.edge} as large regions at the edge of the aperture, ${lesions.rejected.macula} as macular pigmentation, ${lesions.rejected.smooth} as broad smooth shading, ${lesions.rejected.noSeed} for having no core strong enough to seed a region.
         ${lesions.onVesselCount ? `<strong>${lesions.onVesselCount}</strong> of them lie along a vessel and are struck through on the overlay — treat those with extra caution.` : ""}
         ${capped ? `The fundus overlay rings the ${OVERLAY_CIRCLE_LIMIT} largest; both mask canvases show all of them.` : ""}
         ${lesions.discExcluded ? "" : "<em>Optic disc position was unavailable, so the disc was not excluded and its bright pixels may appear as exudate candidates.</em>"}
+        ${lesions.discExcluded && !lesions.discExtentMeasured ? "<em>The disc's extent could not be grown from its own brightness on this image, so only the estimated circle excluded it — bright marks at its margin may have survived.</em>" : ""}
+        ${lesions.discExcluded && lesions.discExtentMeasured && !lesions.discColourUsed ? "<em>Disc and retina did not separate in colour on this image, so peripapillary marks were judged on the measured disc extent alone.</em>" : ""}
         ${lesions.maculaExcluded ? "" : "<em>Macula position was unavailable, so normal macular darkening may appear here as a large dark candidate.</em>"}</p>`
         + (noisy ? `<p class="notice"><strong>This count is too high to be lesions.</strong> ${total} candidates on one image almost always means the detector is firing on image noise, compression artefacts, or texture — the adaptive threshold drops with the image's own contrast, so a grainy photo produces hundreds of spurious specks. Do not read these counts as a lesion burden on this image.</p>` : "");
     }
@@ -2352,30 +3011,8 @@
   }
 
   // ---------------------------------------------------------------------
-  // THROUGHPUT SIMULATION
+  // SMALL RENDER HELPERS
   // ---------------------------------------------------------------------
-  function computeThroughput(inputs){
-    const acquisitionCapacity = inputs.acquisitionPerDay;
-    const transferCapacity = (inputs.bandwidthMbps * 86400) / (inputs.imgSizeMB * 8);
-    const modelCapacity = inputs.modelRatePerMin * 1440;
-    const reviewCapacity = inputs.reviewPerDay;
-
-    const stages = [
-      { name: "Image acquisition", value: acquisitionCapacity },
-      { name: "Network transfer", value: transferCapacity },
-      { name: "Model processing", value: modelCapacity },
-      { name: "Ophthalmologist review", value: reviewCapacity }
-    ];
-    let bottleneck = stages[0];
-    for (const s of stages) if (s.value < bottleneck.value) bottleneck = s;
-
-    const effectiveDaily = bottleneck.value;
-    const backlogPerDay = acquisitionCapacity - effectiveDaily;
-    const daysToTarget = inputs.targetPerYear / effectiveDaily;
-
-    return { stages, bottleneck, effectiveDaily, backlogPerDay, daysToTarget };
-  }
-
   function renderBarRow(container, label, value, maxValue, unit){
     const row = document.createElement("div");
     row.className = "bar-row";
@@ -2500,48 +3137,10 @@
   }
 
   // ---------------------------------------------------------------------
-  // RENDER: STEP 5
-  // ---------------------------------------------------------------------
-  function readThroughputInputs(){
-    return {
-      acquisitionPerDay: parseFloat($("#in-acquisition").value) || 0,
-      bandwidthMbps: parseFloat($("#in-bandwidth").value) || 0,
-      imgSizeMB: parseFloat($("#in-imgsize").value) || 0.01,
-      modelRatePerMin: parseFloat($("#in-modelrate").value) || 0.01,
-      reviewPerDay: parseFloat($("#in-review").value) || 0,
-      targetPerYear: parseFloat($("#in-target").value) || 1
-    };
-  }
-
-  function renderThroughputStep(){
-    const inputs = readThroughputInputs();
-    const result = computeThroughput(inputs);
-    state.lastThroughput = { inputs, result };
-
-    const container = $("#throughput-results");
-    container.innerHTML = "";
-    const maxVal = Math.max(...result.stages.map(s=>s.value));
-    const barsWrap = document.createElement("div");
-    result.stages.forEach(s => renderBarRow(barsWrap, s.name, s.value, maxVal, "/day"));
-    container.appendChild(barsWrap);
-
-    const summary = document.createElement("p");
-    const years = result.daysToTarget/365;
-    summary.innerHTML = `
-      <strong>Bottleneck: ${result.bottleneck.name}</strong> at ${fmt(result.bottleneck.value,0)} images/day.<br>
-      Effective daily screening throughput: ${fmt(result.effectiveDaily,0)} images/day.<br>
-      Backlog growth: ${result.backlogPerDay > 0 ? `+${fmt(result.backlogPerDay,0)} images/day (intake exceeds capacity)` : "none — capacity meets or exceeds intake"}.<br>
-      Time to screen ${fmt(inputs.targetPerYear,0)} people at this rate: ~${fmt(result.daysToTarget,0)} days (~${fmt(years,1)} years).
-    `;
-    container.appendChild(summary);
-    return result;
-  }
-
-  // ---------------------------------------------------------------------
   // RENDER: SUMMARY REPORT
   // ---------------------------------------------------------------------
   function renderReport(){
-    const q = state.lastQuality, g = state.lastGrading, gc = state.lastGradcamDesc, t = state.lastThroughput;
+    const q = state.lastQuality, g = state.lastGrading, gc = state.lastGradcamDesc;
     const body = $("#report-body");
     let html = `<p class="small">Generated ${new Date().toLocaleString()}</p>`;
 
@@ -2600,9 +3199,6 @@
       html += `<h3>Lesion candidates</h3><p>No candidate regions passed the filters. This does not indicate a normal retina.</p>`;
     } else {
       html += `<h3>Lesion candidates</h3><p>Not computed for this image.</p>`;
-    }
-    if (t){
-      html += `<h3>Throughput simulation (planning only)</h3><p>Bottleneck: <strong>${t.result.bottleneck.name}</strong> at ${fmt(t.result.bottleneck.value,0)} images/day. Effective throughput ${fmt(t.result.effectiveDaily,0)} images/day. Estimated ${fmt(t.result.daysToTarget,0)} days to screen ${fmt(t.inputs.targetPerYear,0)} people.</p>`;
     }
     html += `<p class="small">Research/hackathon prototype for SIH26038. Not a certified medical device. Classifier provenance and limitations are documented in the page footer.</p>`;
     body.innerHTML = html;
@@ -2681,9 +3277,9 @@
       enhancedCanvas.height = procCanvas.height;
       enhancedCanvas.getContext("2d").drawImage(procCanvas, 0, 0);
 
-      // The classifier and Grad-CAM need the model. Landmarks, lesion detection,
-      // the grading rule and the throughput sim do not, so a failed model download
-      // costs those stages nothing and they still run.
+      // The classifier and Grad-CAM need the model. Landmarks, lesion detection
+      // and the grading rule do not, so a failed model download costs those
+      // stages nothing and they still run.
       const modelRan = state.modelReady;
 
       showStep("step2");
@@ -2696,12 +3292,6 @@
         state.lastGrading = gradingResult;
         renderGradingStep(gradingResult);
 
-        if (state.measuredThroughputPerMin === null){
-          state.measuredThroughputPerMin = 60000/gradingResult.elapsedMs;
-          const modelRateInput = $("#in-modelrate");
-          modelRateInput.value = state.measuredThroughputPerMin.toFixed(2);
-          $("#modelrate-note").textContent = `Measured live from this session: one image took ${gradingResult.elapsedMs.toFixed(0)} ms, i.e. ${state.measuredThroughputPerMin.toFixed(2)} images/min on this device. Editable above.`;
-        }
       }
 
       // 3b: anatomical landmarks. Computed before Grad-CAM because both step 3
@@ -2767,10 +3357,6 @@
         renderReferBanner(sev);
       }
 
-      // STEP 5: throughput (auto-render once with current/measured inputs)
-      showStep("step5");
-      renderThroughputStep();
-
       // SUMMARY
       showStep("report");
       renderReport();
@@ -2823,6 +3409,8 @@
       SEED_FLOOR_DARK = parseFloat($("#tune-dark").value) || SEED_FLOOR_DARK;
       SEED_FLOOR_BRIGHT = parseFloat($("#tune-bright").value) || SEED_FLOOR_BRIGHT;
       MIN_CONTRAST_K = parseFloat($("#tune-contrast").value) || MIN_CONTRAST_K;
+      // Below 1 nothing can ever pass, which would silently empty the overlay.
+      SATURATION_MAX_GROWTH = clamp(parseFloat($("#tune-growth").value) || SATURATION_MAX_GROWTH, 1.0, 3.0);
       const btn = $("#rerun-detection");
       btn.disabled = true;
       document.getElementById("lesion-summary").innerHTML =
@@ -2848,11 +3436,6 @@
       } finally{
         btn.disabled = false;
       }
-    });
-
-    $("#calc-throughput").addEventListener("click", () => {
-      renderThroughputStep();
-      if (state.lastQuality) renderReport();
     });
 
     $("#print-button").addEventListener("click", () => {
