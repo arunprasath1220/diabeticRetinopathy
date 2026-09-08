@@ -74,8 +74,17 @@ reference.html    Clinical reference and method summary
 css/style.css     All styling for every page
 js/app.js         The screening engine
 js/pipeline.js    The capacity model (independent of the screening engine)
+matlab/           MATLAB/Simulink implementation of the same pipeline
 README.md         This file
 ```
+
+There are two implementations of the same algorithm, and both are first-class.
+`js/app.js` is the live demo — it opens in a browser with no installation, which is what makes it
+demonstrable anywhere, on anything. `matlab/` is the reference implementation in the environment
+this project targets, using the Image Processing, Computer Vision, Deep Learning, Medical Imaging,
+and Statistics and Machine Learning toolboxes, with the district deployment simulation in Simulink.
+See [matlab/README.md](matlab/README.md) for the stage-by-stage correspondence between the two, and
+for the handful of places where they will not agree to the last bit.
 
 `js/app.js` is one IIFE with no dependencies other than TensorFlow.js, which `screening.html`
 loads from a CDN. It is deliberately not an ES module, because ES modules are blocked when a page is
@@ -249,8 +258,13 @@ long a target population would take to screen.
 Model throughput is **measured live** from the actual inference time on your device rather than
 assumed.
 
-A production version of this analysis would be a Simulink model in MATLAB. This is a lightweight
-stand-in for early planning.
+A production version of this analysis is the Simulink model in
+[matlab/simulink/](matlab/simulink/), which simulates arrivals, the quality gate, a finite uplink
+queue, inference and specialist workload over a thirty-day horizon. The in-browser version here is a
+lightweight stand-in for early planning, and the two differ in one way worth knowing: this one
+computes steady-state capacity, while the Simulink model queues. Screening happens in camps rather
+than as a steady stream, and a queue is the only way to see the morning surge that actually breaks
+the uplink.
 
 The full version of it lives on its own page, `pipeline.html` — see
 [the capacity model](#the-capacity-model) below.
